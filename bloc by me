@@ -1,0 +1,169 @@
+//+------------------------------------------------------------------+
+//|                                         OrderBlockEA_TSL.mq5     |
+//|   Institutional Order Block Trading EA with Trailing Stop        |
+//|   Converts logic from TradingView Pine Script into MQL5          |
+//+------------------------------------------------------------------+
+#property strict
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//---- Inputs
+input int    periods        = 5;        // Relevant Periods for OB detection
+input double threshold      = 0.0;      // Min percent move to validate OB
+input bool   useWicks       = false;    // Use full wick range instead of open/high or open/low
+input double lotSize        = 0.10;     // Lot size per trade
+input double riskReward     = 2.0;      // Risk/Reward ratio
+input int    trailingPoints = 300;      // Trailing Stop distance (points)
+
+//---- Internal
+datetime last_processed_time = 0;
+
+//+------------------------------------------------------------------+
+//| Place trade with SL/TP                                           |
+//+------------------------------------------------------------------+
+void PlaceOrder(bool isBuy, double obHigh, double obLow)
+{
+   double sl, tp, price;
+   double stopDistance = MathAbs(obHigh - obLow);
+
+   if(isBuy)
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      sl    = obLow;
+      tp    = price + (stopDistance * riskReward);
+      if(trade.Buy(lotSize, _Symbol, price, sl, tp))
+         Print("BUY placed at ", DoubleToString(price,_Digits),
+               " SL=", DoubleToString(sl,_Digits),
+               " TP=", DoubleToString(tp,_Digits));
+      else
+         Print("BUY failed. Error: ", GetLastError());
+   }
+   else
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      sl    = obHigh;
+      tp    = price - (stopDistance * riskReward);
+      if(trade.Sell(lotSize, _Symbol, price, sl, tp))
+         Print("SELL placed at ", DoubleToString(price,_Digits),
+               " SL=", DoubleToString(sl,_Digits),
+               " TP=", DoubleToString(tp,_Digits));
+      else
+         Print("SELL failed. Error: ", GetLastError());
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Apply trailing stop to all open positions                        |
+//+------------------------------------------------------------------+
+void ApplyTrailingStop()
+{
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      string sym = PositionGetSymbol(i);
+      if(!PositionSelect(sym)) continue;
+
+      long   type   = PositionGetInteger(POSITION_TYPE);
+      double price  = (type==POSITION_TYPE_BUY) ? SymbolInfoDouble(sym,SYMBOL_BID)
+                                                : SymbolInfoDouble(sym,SYMBOL_ASK);
+      double sl     = PositionGetDouble(POSITION_SL);
+      double open   = PositionGetDouble(POSITION_PRICE_OPEN);
+
+      // For BUY
+      if(type==POSITION_TYPE_BUY)
+      {
+         double newSL = price - trailingPoints * _Point;
+         if(newSL > sl && newSL > open)
+         {
+            if(trade.PositionModify(sym,newSL,PositionGetDouble(POSITION_TP)))
+               Print("Trailing Stop updated for BUY: ", DoubleToString(newSL,_Digits));
+         }
+      }
+      // For SELL
+      if(type==POSITION_TYPE_SELL)
+      {
+         double newSL = price + trailingPoints * _Point;
+         if((sl==0.0 || newSL < sl) && newSL < open)
+         {
+            if(trade.PositionModify(sym,newSL,PositionGetDouble(POSITION_TP)))
+               Print("Trailing Stop updated for SELL: ", DoubleToString(newSL,_Digits));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Expert initialization                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   Print("Order Block EA with Trailing Stop initialized.");
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization                                          |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("Order Block EA stopped.");
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // Trailing Stop every tick
+   ApplyTrailingStop();
+
+   // Only process new closed candle
+   datetime prevBarTime = iTime(_Symbol, _Period, 1);
+   if(prevBarTime == last_processed_time) return;
+   last_processed_time = prevBarTime;
+
+   int ob_period = periods+1;
+   if(iBars(_Symbol,_Period) <= ob_period+2) return;
+
+   // Get OB candidate candle
+   double open_ob  = iOpen(_Symbol,_Period,ob_period);
+   double close_ob = iClose(_Symbol,_Period,ob_period);
+   double high_ob  = iHigh(_Symbol,_Period,ob_period);
+   double low_ob   = iLow(_Symbol,_Period,ob_period);
+   double close_recent = iClose(_Symbol,_Period,1);
+
+   // Percent move
+   double absmove = 0.0;
+   if(MathAbs(close_ob) > 0.0)
+      absmove = MathAbs(close_recent - close_ob) / MathAbs(close_ob) * 100.0;
+   bool relmove = (absmove >= threshold);
+
+   // Count up and down candles
+   int upcandles=0, downcandles=0;
+   for(int i=1;i<=periods;i++)
+   {
+      double o=iOpen(_Symbol,_Period,i);
+      double c=iClose(_Symbol,_Period,i);
+      if(c>o) upcandles++;
+      if(c<o) downcandles++;
+   }
+
+   // Bullish OB: last down candle, followed by up candles
+   bool bullishOB = (close_ob < open_ob) && (upcandles==periods) && relmove;
+   if(bullishOB)
+   {
+      double ob_high = useWicks ? high_ob : open_ob;
+      double ob_low  = low_ob;
+      PlaceOrder(true, ob_high, ob_low);
+   }
+
+   // Bearish OB: last up candle, followed by down candles
+   bool bearishOB = (close_ob > open_ob) && (downcandles==periods) && relmove;
+   if(bearishOB)
+   {
+      double ob_high = high_ob;
+      double ob_low  = useWicks ? low_ob : open_ob;
+      PlaceOrder(false, ob_high, ob_low);
+   }
+}
+//+------------------------------------------------------------------+
