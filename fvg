@@ -1,225 +1,326 @@
 //+------------------------------------------------------------------+
-//|              OrderBlockEA_OB_FVG_DynamicLot.mq5                  |
-//|   OB + FVG + Dynamic Lot + ATR Trailing Stop                     |
+//| OrderBlockEA_FVG_DynamicLot_TSL_Body_ClosedCandle_Fixed_MERGED.mq5|
+//| FVG + Dynamic Lot + Trailing Stop + Tick Crossing + Body Only    |
+//| Zones added after candle close + visual rectangles + SL modes    |
 //+------------------------------------------------------------------+
 #property strict
 #include <Trade/Trade.mqh>
 CTrade trade;
 
-//---- Inputs
-input int    periods        = 5;        // Relevant periods for OB detection
-input double riskPerTrade   = 1.0;      // Risk % of balance per trade
-input int    atrPeriod      = 14;       // ATR period
-input double atrMultiplier  = 1.5;      // ATR multiplier for OB SL
-input double rrRatio        = 2.0;      // RR for OB trades
-input ENUM_TIMEFRAMES OB_TF = PERIOD_M1;// Timeframe for OB/FVG detection
-input double trailATRmult   = 1.0;      // ATR multiplier for trailing stop
-input double threshold      = 0.0;      // Min % move to validate OB
-input bool   useWicks       = false;    // Use full wick range
-
-// FVG-specific inputs
+//---- Inputs (tweak as needed)
+input double riskPerTrade   = 1.0;       // Risk % of balance per trade
+input ENUM_TIMEFRAMES OB_TF = PERIOD_M1;// Timeframe for FVG detection
 input double fvgRR          = 1.5;      // RR for FVG trades
+input int    atrPeriod      = 14;       // ATR period for trailing SL
+input double trailATRmult   = 1.0;      // ATR multiplier for trailing SL
+input double minProfitUSD   = 0.40;     // Close early if profit >= X USD
+input double minStopUSD     = 2.0;      // Minimum stop loss in USD
+input int    zoneExpireBars = 20;       // Remove pending FVG if not triggered within X bars
+input double tickBuffer     = 1.0;      // Optional buffer in points to trigger FVG entry
+input double extraSLPoints  = 5.0;      // Extra points to add to SL
+input int    zoneDrawBars   = 10;       // How many bars forward to draw rectangle
+
+// SL Mode: 0 = Gap-based, 1 = ATR-based, 2 = Fixed points
+input int    SLMode         = 0;
+input double fixedSLPoints  = 200.0;    // used when SLMode == 2
+input double maxSLPoints    = 1000.0;   // cap on SL distance (points)
 
 //---- Internal
 datetime last_processed_time = 0;
+double lastBid = 0.0;
+double lastAsk = 0.0;
+
+// Struct for pending FVG zones
+struct FVGZone
+{
+   bool isBuy;      // true = bullish, false = bearish (detection)
+   double high;
+   double low;
+   datetime createTime;
+   string objName;
+};
+
+// Array of pending zones
+FVGZone pendingFVGs[];
 
 //+------------------------------------------------------------------+
-//| Helper: Get ATR value                                            |
+//| Helper: Get ATR value (points)                                   |
 //+------------------------------------------------------------------+
-double GetATRPoints(ENUM_TIMEFRAMES tf, int period, int shift)
+double GetATRPoints(ENUM_TIMEFRAMES tf,int period,int shift)
 {
    int handle = iATR(_Symbol, tf, period);
-   if(handle == INVALID_HANDLE) return 0.0;
+   if(handle==INVALID_HANDLE) return 0.0;
 
    double values[];
-   if(CopyBuffer(handle, 0, shift, 1, values) <= 0) return 0.0;
-
+   ArrayResize(values,1);
+   if(CopyBuffer(handle,0,shift,1,values)<=0)
+   {
+      IndicatorRelease(handle);
+      return 0.0;
+   }
+   IndicatorRelease(handle);
    return values[0];
 }
 
 //+------------------------------------------------------------------+
-//| Helper: Calculate dynamic lot size                               |
+//| Calculate dynamic lot size                                       |
 //+------------------------------------------------------------------+
 double CalculateLot(double stopLossPoints)
 {
-   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskMoney = balance * riskPerTrade / 100.0;
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = balance * riskPerTrade/100.0;
 
    double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
 
    if(stopLossPoints <= 0.0 || tickValue <= 0.0 || tickSize <= 0.0)
-      return 0.01;
+      return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
 
-   double lot = riskMoney / (stopLossPoints / tickSize * tickValue);
+   // stopLossPoints is in points; amount per lot = (stopLossPoints / tickSize) * tickValue
+   double perLotRisk = (stopLossPoints / tickSize) * tickValue;
+   if(perLotRisk <= 0.0) return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+
+   double lot = riskMoney / perLotRisk;
+
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
 
-   lot = MathFloor(lot / lotStep) * lotStep;
-   lot = MathMax(minLot, MathMin(maxLot, lot));
+   if(lotStep <= 0.0) lotStep = 0.01;
 
+   lot = MathFloor(lot/lotStep)*lotStep;
+   lot = MathMax(minLot, MathMin(maxLot, lot));
    return lot;
 }
 
 //+------------------------------------------------------------------+
-//| Place OB Order                                                   |
+//| Draw rectangle for pending FVG                                   |
 //+------------------------------------------------------------------+
-void PlaceOBOrder(bool isBuy, double obHigh, double obLow)
+string DrawFVGRectangle(FVGZone &zone)
 {
-   double atr = GetATRPoints(OB_TF, atrPeriod, 0);
-   if(atr <= 0) return;
+   string name = "FVG_"+TimeToString(zone.createTime,TIME_DATE|TIME_SECONDS)+"_"+(zone.isBuy?"B":"S");
+   datetime t1 = zone.createTime;
+   datetime t2 = t1 + PeriodSeconds(OB_TF)*zoneDrawBars;
 
-   double stopLossPoints = atr * atrMultiplier / SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   double lotSize = CalculateLot(stopLossPoints);
-
-   double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                        : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   double sl, tp;
-   if(isBuy)
-   {
-      sl = obLow;
-      tp = price + (MathAbs(obHigh - obLow) * rrRatio);
-      if(trade.Buy(lotSize, _Symbol, price, sl, tp))
-         Print("OB BUY placed: lot=",lotSize," SL=",sl," TP=",tp);
-   }
+   if(!ObjectCreate(0,name,OBJ_RECTANGLE,0,t1,zone.high,t2,zone.low))
+      Print("ObjectCreate failed for ",name," error=",GetLastError());
    else
    {
-      sl = obHigh;
-      tp = price - (MathAbs(obHigh - obLow) * rrRatio);
-      if(trade.Sell(lotSize, _Symbol, price, sl, tp))
-         Print("OB SELL placed: lot=",lotSize," SL=",sl," TP=",tp);
+      color rectColor = zone.isBuy?clrGreen:clrRed;
+      ObjectSetInteger(0,name,OBJPROP_COLOR,rectColor);
+      ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_SOLID);
+      ObjectSetInteger(0,name,OBJPROP_WIDTH,1);
+      ObjectSetInteger(0,name,OBJPROP_BACK,true);
+      ObjectSetInteger(0,name,OBJPROP_FILL,true);
+      ObjectSetInteger(0,name,OBJPROP_ZORDER,0);
+   }
+   return name;
+}
+
+//+------------------------------------------------------------------+
+//| Delete rectangle                                                 |
+//+------------------------------------------------------------------+
+void DeleteFVGRectangle(string name)
+{
+   if(StringLen(name)==0) return;
+   if(ObjectFind(0,name) != -1)
+      ObjectDelete(0,name);
+}
+
+//+------------------------------------------------------------------+
+//| Place FVG order (reversed logic)                                 |
+//+------------------------------------------------------------------+
+void PlaceFVGOrder(bool isBuy,double gapHigh,double gapLow)
+{
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      string sym = PositionGetString(POSITION_SYMBOL);
+      if(sym == _Symbol)
+      {
+         Print("Skipping new FVG order on ",_Symbol," — trade already open.");
+         return;
+      }
+   }
+
+   bool entryBuy = isBuy;
+   double price = entryBuy ? SymbolInfoDouble(_Symbol,SYMBOL_ASK) 
+                           : SymbolInfoDouble(_Symbol,SYMBOL_BID);
+
+   double slDistancePoints = 0.0;
+   if(SLMode == 0)
+      slDistancePoints = MathAbs(gapHigh - gapLow) / _Point;
+   else if(SLMode == 1)
+   {
+      double atr = GetATRPoints(OB_TF, atrPeriod, 1);
+      if(atr<=0) atr = fixedSLPoints*_Point;
+      slDistancePoints = atr / _Point;
+   }
+   else if(SLMode == 2)
+      slDistancePoints = fixedSLPoints;
+   else
+      slDistancePoints = MathAbs(gapHigh - gapLow) / _Point;
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   long brokerMinStops = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopPointsUSD = 0.0;
+   if(tickValue>0 && tickSize>0)
+      minStopPointsUSD = (minStopUSD / tickValue) * tickSize / _Point;
+   double minStopPoints = MathMax(minStopPointsUSD, (double)brokerMinStops);
+
+   if(slDistancePoints < minStopPoints) slDistancePoints = minStopPoints;
+   if(slDistancePoints > maxSLPoints) slDistancePoints = maxSLPoints;
+   slDistancePoints += extraSLPoints;
+
+   double lotSize = CalculateLot(slDistancePoints);
+
+   double sl = entryBuy ? price - slDistancePoints * _Point 
+                        : price + slDistancePoints * _Point;
+   double tp = entryBuy ? price + slDistancePoints * _Point * fvgRR 
+                        : price - slDistancePoints * _Point * fvgRR;
+
+   bool result = false;
+   if(entryBuy) result = trade.Buy(lotSize,_Symbol,price,sl,tp);
+   else         result = trade.Sell(lotSize,_Symbol,price,sl,tp);
+
+   if(result)
+      Print("FVG ",(entryBuy?"BUY":"SELL"),
+            " opened: gap[",gapLow," - ",gapHigh,"] Lot:",DoubleToString(lotSize,2),
+            " SL:",DoubleToString(sl,_Digits)," TP:",DoubleToString(tp,_Digits));
+   else
+      Print("Failed FVG ",(entryBuy?"BUY":"SELL"),
+            " : gap[",gapLow," - ",gapHigh,"] Error:",GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Detect FVG after candle closes (body-only detection)             |
+//+------------------------------------------------------------------+
+void DetectAndAddFVG()
+{
+   if(Bars(_Symbol,OB_TF) < 3) return;
+
+   double bodyHighPrev = MathMax(iOpen(_Symbol,OB_TF,2), iClose(_Symbol,OB_TF,2));
+   double bodyLowPrev  = MathMin(iOpen(_Symbol,OB_TF,2), iClose(_Symbol,OB_TF,2));
+   double bodyHighCurr = MathMax(iOpen(_Symbol,OB_TF,1), iClose(_Symbol,OB_TF,1));
+   double bodyLowCurr  = MathMin(iOpen(_Symbol,OB_TF,1), iClose(_Symbol,OB_TF,1));
+
+   datetime createTime = iTime(_Symbol, OB_TF, 1);
+
+   if(bodyLowCurr > bodyHighPrev)
+   {
+      FVGZone newZone;
+      newZone.isBuy = true;
+      newZone.high = bodyHighCurr;
+      newZone.low  = bodyLowPrev;
+      newZone.createTime = createTime;
+      newZone.objName = DrawFVGRectangle(newZone);
+
+      ArrayResize(pendingFVGs, ArraySize(pendingFVGs)+1);
+      pendingFVGs[ArraySize(pendingFVGs)-1] = newZone;
+      Print("Bullish FVG added: ",DoubleToString(newZone.low,_Digits)," - ",DoubleToString(newZone.high,_Digits));
+   }
+   else if(bodyHighCurr < bodyLowPrev)
+   {
+      FVGZone newZone;
+      newZone.isBuy = false;
+      newZone.high = bodyHighPrev;
+      newZone.low  = bodyLowCurr;
+      newZone.createTime = createTime;
+      newZone.objName = DrawFVGRectangle(newZone);
+
+      ArrayResize(pendingFVGs, ArraySize(pendingFVGs)+1);
+      pendingFVGs[ArraySize(pendingFVGs)-1] = newZone;
+      Print("Bearish FVG added: ",DoubleToString(newZone.low,_Digits)," - ",DoubleToString(newZone.high,_Digits));
    }
 }
 
 //+------------------------------------------------------------------+
-//| Place FVG Order (No SL, close on profit)                         |
-//+------------------------------------------------------------------+
-void PlaceFVGOrder(bool isBuy, double gapHigh, double gapLow)
-{
-   double lotSize = CalculateLot(100); // dummy value for risk calc
-
-   double price = isBuy ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
-                        : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-
-   double tp; // optional TP based on RR
-   if(isBuy)
-   {
-      tp = price + (MathAbs(gapHigh - gapLow) * fvgRR);
-      if(trade.Buy(lotSize, _Symbol, price, 0.0, tp))   // no SL
-         Print("FVG BUY placed: lot=",lotSize," TP=",tp);
-   }
-   else
-   {
-      tp = price - (MathAbs(gapHigh - gapLow) * fvgRR);
-      if(trade.Sell(lotSize, _Symbol, price, 0.0, tp))  // no SL
-         Print("FVG SELL placed: lot=",lotSize," TP=",tp);
-   }
-}
-//+------------------------------------------------------------------+
-//| Manage FVG trades: Close on profit OR next candle loss           |
+//| Manage profits: close at minProfitUSD                             |
 //+------------------------------------------------------------------+
 void ManageFVGProfits()
 {
-   for(int posIndex = PositionsTotal()-1; posIndex >= 0; posIndex--)
+   for(int posIndex=PositionsTotal()-1; posIndex>=0; posIndex--)
    {
       ulong ticket = PositionGetTicket(posIndex);
-      if(ticket == 0) continue;
+      if(ticket==0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
 
       string sym = PositionGetString(POSITION_SYMBOL);
       if(sym != _Symbol) continue;
 
-      long type       = PositionGetInteger(POSITION_TYPE);
-      double openPrice= PositionGetDouble(POSITION_PRICE_OPEN);
-      double volume   = PositionGetDouble(POSITION_VOLUME);
+      long type = PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      double price = type==POSITION_TYPE_BUY ? SymbolInfoDouble(sym,SYMBOL_BID) : SymbolInfoDouble(sym,SYMBOL_ASK);
 
-      double price = (type == POSITION_TYPE_BUY) ?
-                     SymbolInfoDouble(sym, SYMBOL_BID) :
-                     SymbolInfoDouble(sym, SYMBOL_ASK);
+      double tickValue = SymbolInfoDouble(sym,SYMBOL_TRADE_TICK_VALUE);
+      double tickSize = SymbolInfoDouble(sym,SYMBOL_TRADE_TICK_SIZE);
+      if(tickValue<=0 || tickSize<=0) continue;
 
-      // --- Get tick information for profit calculation ---
-      double tickValue = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
-      double tickSize  = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
-
-      // At least $0.50 profit
-      double minProfitUSD = 0.10;
-
-      // Convert required USD profit into price distance
       double requiredDistance = (minProfitUSD / (tickValue * volume)) * tickSize;
-
-      // Actual price move in favor of position
-      double profitDistance = (type == POSITION_TYPE_BUY) ? 
-                              (price - openPrice) : 
-                              (openPrice - price);
+      double profitDistance = (type==POSITION_TYPE_BUY) ? (price - openPrice) : (openPrice - price);
 
       if(profitDistance >= requiredDistance)
       {
-         if(trade.PositionClose(sym))
-            Print("FVG trade closed with profit >= $0.50 at ", price);
-         continue;
+         if(trade.PositionClose(ticket))
+            Print("Position closed at profit >= $", DoubleToString(minProfitUSD,2), " ticket=", ticket);
+         else
+            Print("Failed to close position ticket=", ticket, " err=", GetLastError());
       }
-
-      // --- Extra condition: if next candle closes and trade still in LOSS -> close ---
-     
    }
 }
 
-
 //+------------------------------------------------------------------+
-//| Trailing stop logic (only for OB trades)                         |
+//| Manage trailing stops                                             |
 //+------------------------------------------------------------------+
 void ManageTrailingStops()
 {
    double atr = GetATRPoints(OB_TF, atrPeriod, 0);
    if(atr <= 0) return;
 
-   for(int posIndex = PositionsTotal() - 1; posIndex >= 0; posIndex--)
+   for(int posIndex=PositionsTotal()-1; posIndex>=0; posIndex--)
    {
       ulong ticket = PositionGetTicket(posIndex);
-      if(ticket == 0) continue;
+      if(ticket==0) continue;
       if(!PositionSelectByTicket(ticket)) continue;
 
-      string sym   = PositionGetString(POSITION_SYMBOL);
-      long   type  = PositionGetInteger(POSITION_TYPE);
-      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      double curSL     = PositionGetDouble(POSITION_SL);
-      double curTP     = PositionGetDouble(POSITION_TP);
+      string sym = PositionGetString(POSITION_SYMBOL);
+      if(sym != _Symbol) continue;
 
-      double price = (type == POSITION_TYPE_BUY) ? 
-                     SymbolInfoDouble(sym, SYMBOL_BID) :
-                     SymbolInfoDouble(sym, SYMBOL_ASK);
+      long type = PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double curSL = PositionGetDouble(POSITION_SL);
+      double curTP = PositionGetDouble(POSITION_TP);
+      double price = (type==POSITION_TYPE_BUY) ? SymbolInfoDouble(sym,SYMBOL_BID) : SymbolInfoDouble(sym,SYMBOL_ASK);
 
       double newSL;
       if(type == POSITION_TYPE_BUY)
       {
          newSL = price - atr * trailATRmult;
          if(newSL > curSL && newSL > openPrice)
-            trade.PositionModify(sym, newSL, curTP);
+         {
+            if(trade.PositionModify(ticket, newSL, curTP))
+               Print("Modified SL for ticket ", ticket, " to ", newSL);
+            else
+               Print("Failed PositionModify for ticket ", ticket, " err=", GetLastError());
+         }
       }
-      else if(type == POSITION_TYPE_SELL)
+      else
       {
          newSL = price + atr * trailATRmult;
          if((curSL == 0.0 || newSL < curSL) && newSL < openPrice)
-            trade.PositionModify(sym, newSL, curTP);
+         {
+            if(trade.PositionModify(ticket, newSL, curTP))
+               Print("Modified SL for ticket ", ticket, " to ", newSL);
+            else
+               Print("Failed PositionModify for ticket ", ticket, " err=", GetLastError());
+         }
       }
    }
-}
-
-//+------------------------------------------------------------------+
-//| Detect Fair Value Gap                                            |
-//+------------------------------------------------------------------+
-int DetectFVG(int shift)
-{
-   double high0 = iHigh(_Symbol,OB_TF,shift+2);
-   double low0  = iLow(_Symbol,OB_TF,shift+2);
-   double high2 = iHigh(_Symbol,OB_TF,shift);
-   double low2  = iLow(_Symbol,OB_TF,shift);
-
-   if(low2 > high0) return 1;   // Bullish FVG
-   if(high2 < low0) return -1;  // Bearish FVG
-   return 0;
 }
 
 //+------------------------------------------------------------------+
@@ -227,67 +328,43 @@ int DetectFVG(int shift)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   ManageFVGProfits();
    ManageTrailingStops();
-   ManageFVGProfits();   // check FVG trades every tick
 
-   // Only process once per bar close
-   datetime curBarTime = iTime(_Symbol, OB_TF, 0);
-   if(curBarTime == last_processed_time) return;
-
-   datetime prevBarTime = iTime(_Symbol, OB_TF, 1);
-   last_processed_time = curBarTime;
-
-   int ob_period = periods;
-   if(iBars(_Symbol, OB_TF) <= ob_period+2) return;
-
-   double open_ob  = iOpen(_Symbol,OB_TF,1);
-   double close_ob = iClose(_Symbol,OB_TF,1);
-   double high_ob  = iHigh(_Symbol,OB_TF,1);
-   double low_ob   = iLow(_Symbol,OB_TF,1);
-   double close_recent = iClose(_Symbol,OB_TF,0);
-
-   double absmove = 0.0;
-   if(MathAbs(close_ob) > 0.0)
-      absmove = MathAbs(close_recent - close_ob) / MathAbs(close_ob) * 100.0;
-   bool relmove = (absmove >= threshold);
-
-   int upcandles=0, downcandles=0;
-   for(int i=1;i<=periods;i++)
+   datetime closedBarTime = iTime(_Symbol, OB_TF, 1);
+   if(closedBarTime != last_processed_time)
    {
-      double o=iOpen(_Symbol,OB_TF,i);
-      double c=iClose(_Symbol,OB_TF,i);
-      if(c>o) upcandles++;
-      if(c<o) downcandles++;
+      DetectAndAddFVG();
+      last_processed_time = closedBarTime;
    }
 
-   bool bullishOB = (close_ob < open_ob) && (upcandles==periods) && relmove;
-   if(bullishOB)
-   {
-      double ob_high = useWicks ? high_ob : open_ob;
-      double ob_low  = low_ob;
-      PlaceOBOrder(true, ob_high, ob_low);
-   }
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   datetime currentBarTime = iTime(_Symbol, OB_TF, 0);
+for(int i = ArraySize(pendingFVGs)-1; i >= 0; i--)
+{
+    if(TimeCurrent() - pendingFVGs[i].createTime > zoneExpireBars * PeriodSeconds(OB_TF))
+    {
+        Print("Expired FVG removed: ", DoubleToString(pendingFVGs[i].low,_Digits)," - ", DoubleToString(pendingFVGs[i].high,_Digits));
+        DeleteFVGRectangle(pendingFVGs[i].objName);
+        ArrayRemove(pendingFVGs, i);
+        continue;
+    }
 
-   bool bearishOB = (close_ob > open_ob) && (downcandles==periods) && relmove;
-   if(bearishOB)
-   {
-      double ob_high = high_ob;
-      double ob_low  = useWicks ? low_ob : open_ob;
-      PlaceOBOrder(false, ob_high, ob_low);
-   }
+    double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   // --- Fair Value Gap Detection ---
-   int fvgSignal = DetectFVG(1);
-   if(fvgSignal == 1) // Bullish FVG
-   {
-      double gapHigh = iHigh(_Symbol,OB_TF,3);
-      double gapLow  = iLow(_Symbol,OB_TF,1);
-      PlaceFVGOrder(true, gapHigh, gapLow);
-   }
-   else if(fvgSignal == -1) // Bearish FVG
-   {
-      double gapHigh = iHigh(_Symbol,OB_TF,1);
-      double gapLow  = iLow(_Symbol,OB_TF,3);
-      PlaceFVGOrder(false, gapHigh, gapLow);
-   }
+    // Entry on zone touch: always opposite of FVG detection
+    if(price >= pendingFVGs[i].low - tickBuffer*_Point && price <= pendingFVGs[i].high + tickBuffer*_Point)
+    {
+        bool entryBuy = !pendingFVGs[i].isBuy; // opposite of detected FVG
+        PlaceFVGOrder(entryBuy, pendingFVGs[i].high, pendingFVGs[i].low);
+
+        DeleteFVGRectangle(pendingFVGs[i].objName);
+        ArrayRemove(pendingFVGs, i);
+    }
+}
+
+
+   lastBid = bid;
+   lastAsk = ask;
 }
