@@ -1,0 +1,379 @@
+//+------------------------------------------------------------------+
+//| OrderBlockEA_FVG_Enhanced_CenterEntry_TPBE.mq5                  |
+//| FVG + Rejection + Dynamic Lot + Trailing Stop + Filters + Center |
+//| + Partial TP + Break-Even                                        |
+//+------------------------------------------------------------------+
+#property strict
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//---- Inputs
+input double riskPerTrade       = 1.0;
+input ENUM_TIMEFRAMES OB_TF     = PERIOD_M1;
+input double fvgRR              = 1.5;
+input int    atrPeriod          = 14;
+input double trailATRmult       = 1.0;
+input double minProfitUSD       = 0.40;
+input double minStopUSD         = 2.0;
+input int    zoneExpireBars     = 20;
+input double tickBuffer         = 1.0;
+input double extraSLPoints      = 5.0;
+input int    zoneDrawBars       = 10;
+input int    SLMode             = 0;
+input double fixedSLPoints      = 200.0;
+input double maxSLPoints        = 1000.0;
+
+// Center-of-FVG entry
+input double centerPercent      = 0.5;   // center = 50%
+input double centerBand         = 0.1;   // ±10% around center
+
+// Partial TP + Break-Even
+input double partialTPPercent   = 50.0;  // % of position to close at partial TP
+input double breakEvenProfit    = 0.5;   // USD profit required to move SL to BE
+
+//---- Internal
+datetime last_processed_time = 0;
+double lastBid = 0.0;
+
+// Struct for pending FVG zones
+struct FVGZone
+{
+   bool isBuy;
+   double high;
+   double low;
+   datetime createTime;
+   string objName;
+};
+FVGZone pendingFVGs[];
+
+//+------------------------------------------------------------------+
+//| Helper: ATR in points                                            |
+//+------------------------------------------------------------------+
+double GetATRPoints(ENUM_TIMEFRAMES tf,int period,int shift)
+{
+   int handle = iATR(_Symbol, tf, period);
+   if(handle==INVALID_HANDLE) return 0.0;
+   double values[];
+   ArrayResize(values,1);
+   if(CopyBuffer(handle,0,shift,1,values)<=0)
+   {
+      IndicatorRelease(handle);
+      return 0.0;
+   }
+   IndicatorRelease(handle);
+   return values[0];
+}
+
+//+------------------------------------------------------------------+
+//| Calculate dynamic lot                                             |
+//+------------------------------------------------------------------+
+double CalculateLot(double stopLossPoints)
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = balance * riskPerTrade/100.0;
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(stopLossPoints <= 0.0 || tickValue <= 0.0 || tickSize <= 0.0)
+      return SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double perLotRisk = (stopLossPoints / tickSize) * tickValue;
+   double lot = riskMoney / perLotRisk;
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lotStep <= 0.0) lotStep = 0.01;
+   lot = MathFloor(lot/lotStep)*lotStep;
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   return lot;
+}
+
+//+------------------------------------------------------------------+
+//| Draw rectangle for pending FVG                                   |
+//+------------------------------------------------------------------+
+string DrawFVGRectangle(FVGZone &zone)
+{
+   string name = "FVG_"+TimeToString(zone.createTime,TIME_DATE|TIME_SECONDS)+"_"+(zone.isBuy?"B":"S");
+   datetime t1 = zone.createTime;
+   datetime t2 = t1 + PeriodSeconds(OB_TF)*zoneDrawBars;
+   if(!ObjectCreate(0,name,OBJ_RECTANGLE,0,t1,zone.high,t2,zone.low))
+      Print("ObjectCreate failed for ",name," error=",GetLastError());
+   else
+   {
+      color rectColor = zone.isBuy?clrGreen:clrRed;
+      ObjectSetInteger(0,name,OBJPROP_COLOR,rectColor);
+      ObjectSetInteger(0,name,OBJPROP_STYLE,STYLE_SOLID);
+      ObjectSetInteger(0,name,OBJPROP_WIDTH,1);
+      ObjectSetInteger(0,name,OBJPROP_BACK,true);
+      ObjectSetInteger(0,name,OBJPROP_FILL,true);
+      ObjectSetInteger(0,name,OBJPROP_ZORDER,0);
+   }
+   return name;
+}
+
+//+------------------------------------------------------------------+
+//| Delete rectangle                                                 |
+//+------------------------------------------------------------------+
+void DeleteFVGRectangle(string name)
+{
+   if(StringLen(name)==0) return;
+   if(ObjectFind(0,name) != -1)
+      ObjectDelete(0,name);
+}
+
+//+------------------------------------------------------------------+
+//| Place FVG order (reversed)                                       |
+//+------------------------------------------------------------------+
+void PlaceFVGOrder(bool entryBuy,double gapHigh,double gapLow)
+{
+   for(int i=0; i<PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket==0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) == _Symbol)
+      {
+         Print("Skipping new FVG order on ",_Symbol," — trade already open.");
+         return;
+      }
+   }
+
+   double price = entryBuy ? SymbolInfoDouble(_Symbol,SYMBOL_ASK) 
+                           : SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double slDistancePoints = 0.0;
+
+   if(SLMode==0) slDistancePoints = MathAbs(gapHigh-gapLow)/_Point;
+   else if(SLMode==1)
+   {
+      double atr = GetATRPoints(OB_TF, atrPeriod, 1);
+      if(atr<=0) atr = fixedSLPoints*_Point;
+      slDistancePoints = atr/_Point;
+   }
+   else if(SLMode==2) slDistancePoints = fixedSLPoints;
+   else slDistancePoints = MathAbs(gapHigh-gapLow)/_Point;
+
+   double tickValue = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   long brokerMinStops = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopPointsUSD = (tickValue>0 && tickSize>0) ? (minStopUSD/tickValue)*tickSize/_Point : 0.0;
+   double minStopPoints = MathMax(minStopPointsUSD,(double)brokerMinStops);
+   if(slDistancePoints<minStopPoints) slDistancePoints = minStopPoints;
+   if(slDistancePoints>maxSLPoints) slDistancePoints = maxSLPoints;
+   slDistancePoints += extraSLPoints;
+
+   double lotSize = CalculateLot(slDistancePoints);
+
+   double sl = entryBuy ? price - slDistancePoints*_Point : price + slDistancePoints*_Point;
+   double tp = entryBuy ? price + slDistancePoints*_Point*fvgRR : price - slDistancePoints*_Point*fvgRR;
+
+   bool result = entryBuy ? trade.Buy(lotSize,_Symbol,price,sl,tp) 
+                          : trade.Sell(lotSize,_Symbol,price,sl,tp);
+
+   if(result)
+      Print("FVG ",(entryBuy?"BUY":"SELL")," opened: gap[",gapLow," - ",gapHigh,"] Lot:",DoubleToString(lotSize,2));
+   else
+      Print("Failed FVG ",(entryBuy?"BUY":"SELL")," : gap[",gapLow," - ",gapHigh,"] Error:",GetLastError());
+}
+
+//+------------------------------------------------------------------+
+//| Filters                                                           |
+//+------------------------------------------------------------------+
+bool TrendFilter(bool entryBuy)
+{
+   double emaFast = iMA(_Symbol, PERIOD_H1, 50, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double emaSlow = iMA(_Symbol, PERIOD_H1, 200,0,MODE_EMA,PRICE_CLOSE,0);
+   if(emaFast>emaSlow && !entryBuy) return false;
+   if(emaFast<emaSlow && entryBuy) return false;
+   return true;
+}
+
+bool CandleReversalConfirmation(bool entryBuy)
+{
+   double open0=iOpen(_Symbol,OB_TF,0), close0=iClose(_Symbol,OB_TF,0);
+   double open1=iOpen(_Symbol,OB_TF,1), close1=iClose(_Symbol,OB_TF,1);
+   if(entryBuy && close0>open0 && close1<open1) return true;
+   if(!entryBuy && close0<open0 && close1>open1) return true;
+   return false;
+}
+
+bool MultiTFAlignment(bool entryBuy)
+{
+   double htEMA=iMA(_Symbol, PERIOD_M5, 50,0,MODE_EMA, PRICE_CLOSE,0);
+   double htPrice=iClose(_Symbol, PERIOD_M5,0);
+   if(entryBuy && htPrice<htEMA) return false;
+   if(!entryBuy && htPrice>htEMA) return false;
+   return true;
+}
+
+bool RSIFilter(bool entryBuy)
+{
+   double rsi=iRSI(_Symbol,OB_TF,14,PRICE_CLOSE,0);
+   if(entryBuy && rsi>70) return false;
+   if(!entryBuy && rsi<30) return false;
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| Center-of-FVG check                                               |
+//+------------------------------------------------------------------+
+bool IsNearFVGCenter(double price, double gapHigh, double gapLow, double centerPercent=0.5, double band=0.1)
+{
+    double center = gapLow + (gapHigh - gapLow) * centerPercent;
+    double halfBand = (gapHigh - gapLow) * band;
+    return (price >= center - halfBand && price <= center + halfBand);
+}
+
+//+------------------------------------------------------------------+
+//| Detect FVG after candle closes                                    |
+//+------------------------------------------------------------------+
+void DetectAndAddFVG()
+{
+   if(Bars(_Symbol,OB_TF)<3) return;
+
+   double bodyHighPrev=MathMax(iOpen(_Symbol,OB_TF,2),iClose(_Symbol,OB_TF,2));
+   double bodyLowPrev=MathMin(iOpen(_Symbol,OB_TF,2),iClose(_Symbol,OB_TF,2));
+   double bodyHighCurr=MathMax(iOpen(_Symbol,OB_TF,1),iClose(_Symbol,OB_TF,1));
+   double bodyLowCurr=MathMin(iOpen(_Symbol,OB_TF,1),iClose(_Symbol,OB_TF,1));
+
+   datetime createTime=iTime(_Symbol, OB_TF, 1);
+
+   if(bodyLowCurr>bodyHighPrev) // Bullish
+   {
+      FVGZone newZone={true,bodyHighCurr,bodyLowPrev,createTime,""};
+      newZone.objName=DrawFVGRectangle(newZone);
+      ArrayResize(pendingFVGs,ArraySize(pendingFVGs)+1);
+      pendingFVGs[ArraySize(pendingFVGs)-1]=newZone;
+   }
+   else if(bodyHighCurr<bodyLowPrev) // Bearish
+   {
+      FVGZone newZone={false,bodyHighPrev,bodyLowCurr,createTime,""};
+      newZone.objName=DrawFVGRectangle(newZone);
+      ArrayResize(pendingFVGs,ArraySize(pendingFVGs)+1);
+      pendingFVGs[ArraySize(pendingFVGs)-1]=newZone;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage profits: Partial TP + Break-Even                           |
+//+------------------------------------------------------------------+
+void ManageFVGProfits()
+{
+    for(int posIndex=PositionsTotal()-1; posIndex>=0; posIndex--)
+    {
+        ulong ticket=PositionGetTicket(posIndex);
+        if(ticket==0) continue;
+        if(!PositionSelectByTicket(ticket)) continue;
+        string sym=PositionGetString(POSITION_SYMBOL);
+        if(sym!=_Symbol) continue;
+
+        long type=PositionGetInteger(POSITION_TYPE);
+        double openPrice=PositionGetDouble(POSITION_PRICE_OPEN);
+        double volume=PositionGetDouble(POSITION_VOLUME);
+        double price=(type==POSITION_TYPE_BUY) ? SymbolInfoDouble(sym,SYMBOL_BID)
+                                               : SymbolInfoDouble(sym,SYMBOL_ASK);
+
+        double tickValue=SymbolInfoDouble(sym,SYMBOL_TRADE_TICK_VALUE);
+        double tickSize=SymbolInfoDouble(sym,SYMBOL_TRADE_TICK_SIZE);
+        if(tickValue<=0 || tickSize<=0) continue;
+
+        double profitUSD=(type==POSITION_TYPE_BUY ? (price-openPrice) : (openPrice-price))*volume/tickSize*tickValue;
+
+        // Partial TP
+        if(profitUSD >= minProfitUSD)
+        {
+            double closeVolume=volume*partialTPPercent/100.0;
+            if(closeVolume>0)
+            {
+                trade.PositionClosePartial(ticket, closeVolume);
+                Print("Partial TP closed: ", DoubleToString(closeVolume,2), " lots, profitUSD=", DoubleToString(profitUSD,2));
+            }
+        }
+
+        // Move SL to Break-Even
+        if(profitUSD >= breakEvenProfit)
+        {
+            double curSL=PositionGetDouble(POSITION_SL);
+            double newSL=openPrice;
+
+            if(type==POSITION_TYPE_BUY && (curSL<newSL || curSL==0))
+                trade.PositionModify(ticket,newSL,PositionGetDouble(POSITION_TP));
+            else if(type==POSITION_TYPE_SELL && (curSL>newSL || curSL==0))
+                trade.PositionModify(ticket,newSL,PositionGetDouble(POSITION_TP));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| Trailing Stops                                                    |
+//+------------------------------------------------------------------+
+void ManageTrailingStops()
+{
+   double atr=GetATRPoints(OB_TF,atrPeriod,0);
+   if(atr<=0) return;
+
+   for(int posIndex=PositionsTotal()-1; posIndex>=0; posIndex--)
+   {
+      ulong ticket=PositionGetTicket(posIndex);
+      if(ticket==0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      string sym=PositionGetString(POSITION_SYMBOL);
+      if(sym!=_Symbol) continue;
+
+      long type=PositionGetInteger(POSITION_TYPE);
+      double openPrice=PositionGetDouble(POSITION_PRICE_OPEN);
+      double curSL=PositionGetDouble(POSITION_SL);
+      double curTP=PositionGetDouble(POSITION_TP);
+      double price=(type==POSITION_TYPE_BUY) ? SymbolInfoDouble(sym,SYMBOL_BID)
+                                             : SymbolInfoDouble(sym,SYMBOL_ASK);
+      double newSL=type==POSITION_TYPE_BUY ? price-atr*trailATRmult : price+atr*trailATRmult;
+
+      if(type==POSITION_TYPE_BUY && (newSL>curSL && newSL>openPrice))
+         trade.PositionModify(ticket,newSL,curTP);
+      else if(type==POSITION_TYPE_SELL && (curSL==0 || newSL<curSL) && newSL<openPrice)
+         trade.PositionModify(ticket,newSL,curTP);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| OnTick                                                            |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   ManageFVGProfits();
+   ManageTrailingStops();
+
+   datetime closedBarTime=iTime(_Symbol,OB_TF,1);
+   if(closedBarTime!=last_processed_time)
+   {
+      DetectAndAddFVG();
+      last_processed_time=closedBarTime;
+   }
+
+   double bid=SymbolInfoDouble(_Symbol,SYMBOL_BID);
+   double ask=SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+   datetime currentBarTime=iTime(_Symbol,OB_TF,0);
+
+   for(int i=ArraySize(pendingFVGs)-1;i>=0;i--)
+   {
+      if(currentBarTime<=pendingFVGs[i].createTime) continue;
+
+      if(TimeCurrent()-pendingFVGs[i].createTime>zoneExpireBars*PeriodSeconds(OB_TF))
+      {
+         DeleteFVGRectangle(pendingFVGs[i].objName);
+         ArrayRemove(pendingFVGs,i);
+         continue;
+      }
+
+      double price = pendingFVGs[i].isBuy ? bid : ask;
+      bool entryBuy = !pendingFVGs[i].isBuy;
+
+      if(IsNearFVGCenter(price,pendingFVGs[i].high,pendingFVGs[i].low,centerPercent,centerBand))
+      {
+         if(TrendFilter(entryBuy) && CandleReversalConfirmation(entryBuy) &&
+            MultiTFAlignment(entryBuy) && RSIFilter(entryBuy))
+         {
+            PlaceFVGOrder(entryBuy,pendingFVGs[i].high,pendingFVGs[i].low);
+            DeleteFVGRectangle(pendingFVGs[i].objName);
+            ArrayRemove(pendingFVGs,i);
+         }
+      }
+   }
+}
