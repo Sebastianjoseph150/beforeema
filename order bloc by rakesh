@@ -2,7 +2,7 @@
 //|                                         CandleTrackerFinal.mq5   |
 //+------------------------------------------------------------------+
 #property copyright "ChatGPT"
-#property version   "1.40"
+#property version   "1.60"
 #property strict
 
 struct CandleData {
@@ -18,7 +18,7 @@ struct CandleData {
 CandleData candleArray[4];
 int candleCount = 0;
 datetime lastCandleTime = 0;
-bool fourthCandleClosed = false;
+double trailingStopPoints = 800; // 800 points = 8 pips for 5-digit broker
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -30,159 +30,155 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   datetime currentCandleTime = iTime(_Symbol, PERIOD_M1, 0);
-   if (currentCandleTime == lastCandleTime)
-      return;
+    datetime currentCandleTime = iTime(_Symbol, PERIOD_M1, 0);
+    if(currentCandleTime == lastCandleTime)
+        return;
 
-   lastCandleTime = currentCandleTime;
-   Print("🕒 New candle closed at ", TimeToString(currentCandleTime, TIME_DATE|TIME_SECONDS));
+    lastCandleTime = currentCandleTime;
+    Print("🕒 New candle closed at ", TimeToString(currentCandleTime, TIME_DATE|TIME_SECONDS));
 
-   // Get last closed candle (shift = 1)
-   CandleData c;
-   c.open  = iOpen(_Symbol, PERIOD_M1, 1);
-   c.close = iClose(_Symbol, PERIOD_M1, 1);
-   c.high  = iHigh(_Symbol, PERIOD_M1, 1);
-   c.low   = iLow(_Symbol, PERIOD_M1, 1);
-   c.time  = iTime(_Symbol, PERIOD_M1, 1);
-   c.isBullish = (c.close > c.open);
+    // Get last closed candle (shift = 1)
+    CandleData c;
+    c.open  = iOpen(_Symbol, PERIOD_M1, 1);
+    c.close = iClose(_Symbol, PERIOD_M1, 1);
+    c.high  = iHigh(_Symbol, PERIOD_M1, 1);
+    c.low   = iLow(_Symbol, PERIOD_M1, 1);
+    c.time  = iTime(_Symbol, PERIOD_M1, 1);
+    c.isBullish = (c.close > c.open);
 
-   double upperWick = c.high - MathMax(c.open, c.close);
-   double lowerWick = MathMin(c.open, c.close) - c.low;
-   double body = MathAbs(c.close - c.open);
+    double upperWick = c.high - MathMax(c.open, c.close);
+    double lowerWick = MathMin(c.open, c.close) - c.low;
+    double body = MathAbs(c.close - c.open);
 
-   PrintFormat("Candle Info: Time=%s | Bullish=%s | O=%.5f C=%.5f H=%.5f L=%.5f | UpperWick=%.5f LowerWick=%.5f Body=%.5f",
-      TimeToString(c.time, TIME_DATE|TIME_SECONDS),
-      c.isBullish ? "True" : "False",
-      c.open, c.close, c.high, c.low,
-      upperWick, lowerWick, body);
+    PrintFormat("Candle Info: Time=%s | Bullish=%s | O=%.5f C=%.5f H=%.5f L=%.5f | UpperWick=%.5f LowerWick=%.5f Body=%.5f",
+        TimeToString(c.time, TIME_DATE|TIME_SECONDS),
+        c.isBullish ? "True" : "False",
+        c.open, c.close, c.high, c.low,
+        upperWick, lowerWick, body);
 
-   // Check sequence and add
-   if (CheckCandleSequence(c))
-      AddCandle(c);
-   else
-   {
-      Print("❌ Condition violated → Resetting array");
-      ResetCandleArray();
-   }
+    // Check sequence and add
+    if(CheckCandleSequence(c))
+    {
+        AddCandle(c);
+    }
+    else
+    {
+        Print("❌ Condition violated → Resetting array & storing violated candle");
 
-   // If 4th candle closed previously, now clear the array
-   if(fourthCandleClosed)
-   {
-      
-      fourthCandleClosed = false;
-   }
+        // If previous candle exists and same type as violated candle
+        if(candleCount > 0 && candleArray[candleCount-1].isBullish == c.isBullish)
+        {
+            // Store previous candle and violated candle as first two
+            CandleData prev = candleArray[candleCount-1];
+            ResetCandleArray();
+            candleArray[0] = prev;
+            candleArray[1] = c;
+            candleCount = 2;
+            Print("🔁 Previous candle and violated candle are same type → Stored as first two candles");
+        }
+        else
+        {
+            // Only store violating candle as first
+            ResetCandleArray();
+            candleArray[0] = c;
+            candleCount = 1;
+            Print("🔁 Only violated candle stored as first candle");
+        }
+    }
+
+    // Apply trailing stop for open positions
+    ApplyTrailingStop();
 }
 
 //+------------------------------------------------------------------+
-//| Check Candle Sequence                                             |
-//+------------------------------------------------------------------+
 bool CheckCandleSequence(const CandleData &c)
 {
-   if (candleCount == 0)
-      return true;
-
-   if (candleCount == 1)
-   {
-      bool sameType = (c.isBullish == candleArray[0].isBullish);
-      Print("🟩 2nd Candle → ", sameType ? "Same type ✅" : "Different ❌");
-      return sameType;
-   }
-
-   if (candleCount == 2)
-   {
-      bool oppositeType = (c.isBullish != candleArray[0].isBullish);
-      Print("🟨 3rd Candle → ", oppositeType ? "Opposite type ✅" : "Same ❌");
-      return oppositeType;
-   }
-
-   if (candleCount == 3)
-   {
-      bool sameType = (c.isBullish == candleArray[2].isBullish);
-      Print("🟥 4th Candle → ", sameType ? "Same as 3rd ✅" : "Different ❌");
-      return sameType;
-   }
-
+   if(candleCount == 0) return true;
+   if(candleCount == 1) return (c.isBullish == candleArray[0].isBullish);
+   if(candleCount == 2) return (c.isBullish != candleArray[0].isBullish);
+   if(candleCount == 3) return (c.isBullish == candleArray[2].isBullish);
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| Add Candle and check extra conditions                             |
-//+------------------------------------------------------------------+
 void AddCandle(const CandleData &c)
 {
-   if (candleCount < 4)
+   if(candleCount < 4)
    {
       candleArray[candleCount] = c;
       candleCount++;
       PrintFormat("✅ Candle stored in array [%d/4]", candleCount);
    }
 
-   if (candleCount == 4)
+   if(candleCount == 4)
    {
       Print("✅ Pattern complete! Displaying candles...");
       PrintPattern();
 
-      // --- CHECK EXTRA CONDITION BEFORE TRADING ---
+      // Check trade conditions
       CheckExtraConditionAndTrade();
 
-      // Wait until next candle to reset array
-      fourthCandleClosed = true;
+      // After trade or failed condition → store 3rd & 4th as first two
+      CandleData c3 = candleArray[2];
+      CandleData c4 = candleArray[3];
+      ResetCandleArray();
+      candleArray[0] = c3;
+      candleArray[1] = c4;
+      candleCount = 2;
+      Print("🔁 3rd & 4th candles stored as first two for next sequence");
    }
 }
 
-//+------------------------------------------------------------------+
-//| Check Extra Condition and open trades                             |
 //+------------------------------------------------------------------+
 void CheckExtraConditionAndTrade()
 {
    double lotSize = 0.1;
-   double sl = 0;
-   double tp = 0;
    string symbol = _Symbol;
    int slippage = 5;
+   double sl = 0;
+   double tp = 0;
 
-   if(candleArray[3].isBullish) // Bullish 4th
+   if(candleArray[3].isBullish) // Bullish
    {
-      double high12 = MathMax(candleArray[0].high, candleArray[1].high); // include wick
+      double high12 = MathMax(candleArray[0].high, candleArray[1].high);
       double high34 = MathMax(candleArray[2].open, candleArray[2].close);
-      high34 = MathMax(high34, MathMax(candleArray[3].open, candleArray[3].close)); // body only
+      high34 = MathMax(high34, MathMax(candleArray[3].open, candleArray[3].close));
 
       if(high34 > high12)
       {
-         Print("📈 Bullish condition met → Opening BUY");
+         // SL = lowest among 4 candles
+         sl = MathMin(MathMin(candleArray[0].low, candleArray[1].low),
+                      MathMin(candleArray[2].low, candleArray[3].low));
+         Print("📈 Bullish condition met → Opening BUY | SL=", sl);
          tradeBuy(symbol, lotSize, sl, tp, slippage);
-         ResetCandleArray();
       }
       else
          Print("⚠️ Bullish condition not met → Trade skipped");
-         ResetCandleArray();
    }
-   else // Bearish 4th
+   else // Bearish
    {
-      double low12 = MathMin(candleArray[0].low, candleArray[1].low); // include wick
+      double low12 = MathMin(candleArray[0].low, candleArray[1].low);
       double low34 = MathMin(candleArray[2].open, candleArray[2].close);
-      low34 = MathMin(low34, MathMin(candleArray[3].open, candleArray[3].close)); // body only
+      low34 = MathMin(low34, MathMin(candleArray[3].open, candleArray[3].close));
 
       if(low34 < low12)
       {
-         Print("📉 Bearish condition met → Opening SELL");
+         // SL = highest among 4 candles
+         sl = MathMax(MathMax(candleArray[0].high, candleArray[1].high),
+                      MathMax(candleArray[2].high, candleArray[3].high));
+         Print("📉 Bearish condition met → Opening SELL | SL=", sl);
          tradeSell(symbol, lotSize, sl, tp, slippage);
-         ResetCandleArray();
       }
       else
          Print("⚠️ Bearish condition not met → Trade skipped");
-         ResetCandleArray();
    }
-   ResetCandleArray();
 }
 
-//+------------------------------------------------------------------+
-//| Print Pattern                                                    |
 //+------------------------------------------------------------------+
 void PrintPattern()
 {
    Print("---- STORED 4 CANDLES ----");
-   for (int i = 0; i < 4; i++)
+   for(int i=0; i<4; i++)
    {
       PrintFormat("#%d → Time=%s | %s | O=%.5f C=%.5f H=%.5f L=%.5f",
          i+1,
@@ -195,12 +191,10 @@ void PrintPattern()
 }
 
 //+------------------------------------------------------------------+
-//| Reset Candle Array                                               |
-//+------------------------------------------------------------------+
 void ResetCandleArray()
 {
    candleCount = 0;
-   for (int i = 0; i < 4; i++)
+   for(int i=0; i<4; i++)
    {
       candleArray[i].open = 0;
       candleArray[i].close = 0;
@@ -213,27 +207,23 @@ void ResetCandleArray()
 }
 
 //+------------------------------------------------------------------+
-//| Trade Buy Helper                                                 |
-//+------------------------------------------------------------------+
 void tradeBuy(string symbol, double lot, double sl, double tp, int slippage)
 {
    double price = SymbolInfoDouble(symbol, SYMBOL_ASK);
    MqlTradeRequest request;
-   MqlTradeResult  result;
+   MqlTradeResult result;
+   ZeroMemory(request); ZeroMemory(result);
 
-   ZeroMemory(request);
-   ZeroMemory(result);
-
-   request.action   = TRADE_ACTION_DEAL;
-   request.symbol   = symbol;
-   request.volume   = lot;
-   request.type     = ORDER_TYPE_BUY;
-   request.price    = price;
-   request.sl       = sl;
-   request.tp       = tp;
-   request.deviation= slippage;
-   request.magic    = 123456;
-   request.comment  = "CandleTrackerBuy";
+   request.action    = TRADE_ACTION_DEAL;
+   request.symbol    = symbol;
+   request.volume    = lot;
+   request.type      = ORDER_TYPE_BUY;
+   request.price     = price;
+   request.sl        = sl;
+   request.tp        = tp;
+   request.deviation = slippage;
+   request.magic     = 123456;
+   request.comment   = "CandleTrackerBuy";
 
    if(!OrderSend(request, result))
       Print("❌ BUY OrderSend failed: ", GetLastError());
@@ -242,30 +232,74 @@ void tradeBuy(string symbol, double lot, double sl, double tp, int slippage)
 }
 
 //+------------------------------------------------------------------+
-//| Trade Sell Helper                                                |
-//+------------------------------------------------------------------+
 void tradeSell(string symbol, double lot, double sl, double tp, int slippage)
 {
    double price = SymbolInfoDouble(symbol, SYMBOL_BID);
    MqlTradeRequest request;
-   MqlTradeResult  result;
+   MqlTradeResult result;
+   ZeroMemory(request); ZeroMemory(result);
 
-   ZeroMemory(request);
-   ZeroMemory(result);
-
-   request.action   = TRADE_ACTION_DEAL;
-   request.symbol   = symbol;
-   request.volume   = lot;
-   request.type     = ORDER_TYPE_SELL;
-   request.price    = price;
-   request.sl       = sl;
-   request.tp       = tp;
-   request.deviation= slippage;
-   request.magic    = 123456;
-   request.comment  = "CandleTrackerSell";
+   request.action    = TRADE_ACTION_DEAL;
+   request.symbol    = symbol;
+   request.volume    = lot;
+   request.type      = ORDER_TYPE_SELL;
+   request.price     = price;
+   request.sl        = sl;
+   request.tp        = tp;
+   request.deviation = slippage;
+   request.magic     = 123456;
+   request.comment   = "CandleTrackerSell";
 
    if(!OrderSend(request, result))
       Print("❌ SELL OrderSend failed: ", GetLastError());
    else
       Print("✅ SELL Order opened at ", price);
 }
+
+//+------------------------------------------------------------------+
+void ApplyTrailingStop()
+{
+    int total = PositionsTotal();
+    for(int i=0; i<total; i++)
+    {
+        ulong ticket = PositionGetTicket(i);
+        if(PositionSelectByTicket(ticket))
+        {
+            string symbol = PositionGetString(POSITION_SYMBOL);
+            long type = PositionGetInteger(POSITION_TYPE);
+            double sl = PositionGetDouble(POSITION_SL);
+            double tp = PositionGetDouble(POSITION_TP);
+            double currentPrice = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+            if(type == POSITION_TYPE_BUY)
+            {
+                double newSL = currentPrice - trailingStopPoints * _Point;
+                if(newSL > sl) tradeModify(ticket, newSL, tp);
+            }
+            else if(type == POSITION_TYPE_SELL)
+            {
+                double newSL = currentPrice + trailingStopPoints * _Point;
+                if(newSL < sl) tradeModify(ticket, newSL, tp);
+            }
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+void tradeModify(ulong ticket, double sl, double tp)
+{
+   MqlTradeRequest request;
+   MqlTradeResult result;
+   ZeroMemory(request); ZeroMemory(result);
+
+   request.action   = TRADE_ACTION_SLTP;
+   request.position = ticket;
+   request.sl       = sl;
+   request.tp       = tp;
+
+   if(!OrderSend(request, result))
+      Print("❌ Order modification failed: ", GetLastError());
+   else
+      Print("✅ Order modified: SL=", sl, " TP=", tp);
+}
+//+------------------------------------------------------------------+
