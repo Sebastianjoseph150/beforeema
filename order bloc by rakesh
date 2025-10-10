@@ -4,6 +4,8 @@
 #property copyright "ChatGPT"
 #property version   "1.60"
 #property strict
+#include <Trade/Trade.mqh>
+CTrade trade;
 
 struct CandleData {
    double open;
@@ -18,7 +20,12 @@ struct CandleData {
 CandleData candleArray[4];
 int candleCount = 0;
 datetime lastCandleTime = 0;
-double trailingStopPoints = 800; // 800 points = 8 pips for 5-digit broker
+
+input double RiskRewardRatio = 1.0;      // Take Profit = RRR × Risk
+input double BreakEvenTrigger = 300;     // Move SL to BE after profit in points (e.g. 300 = 30 pips if 5-digit)
+input double BreakEvenBuffer = 50; 
+input int    trailingPoints = 600;      // Trailing Stop distance (points)
+input int    initialSLPoints= 2000;        // Add small profit buffer (e.g. 50 = 5 pips)
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -30,10 +37,18 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+
+ // Ensure every trade has a stop loss
+   SetInitialStopLoss();
+
+   // Manage trailing stop
+   ApplyATRTrailingStop();
+   
+   
     datetime currentCandleTime = iTime(_Symbol, PERIOD_M1, 0);
     if(currentCandleTime == lastCandleTime)
         return;
-
+   
     lastCandleTime = currentCandleTime;
     Print("🕒 New candle closed at ", TimeToString(currentCandleTime, TIME_DATE|TIME_SECONDS));
 
@@ -86,8 +101,7 @@ void OnTick()
         }
     }
 
-    // Apply trailing stop for open positions
-    ApplyTrailingStop();
+    
 }
 
 //+------------------------------------------------------------------+
@@ -132,45 +146,77 @@ void AddCandle(const CandleData &c)
 //+------------------------------------------------------------------+
 void CheckExtraConditionAndTrade()
 {
-   double lotSize = 0.1;
+   double lotSize = 0.01;
    string symbol = _Symbol;
    int slippage = 5;
    double sl = 0;
    double tp = 0;
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
-   if(candleArray[3].isBullish) // Bullish
+   // ---- Bullish Condition ----
+   if(candleArray[3].isBullish)
    {
+      // (1) Highest wick price among candle 1 and 2
       double high12 = MathMax(candleArray[0].high, candleArray[1].high);
-      double high34 = MathMax(candleArray[2].open, candleArray[2].close);
-      high34 = MathMax(high34, MathMax(candleArray[3].open, candleArray[3].close));
 
-      if(high34 > high12)
+      // (2) Highest body price among candle 3 and 4 (only open/close)
+      double high34Body = MathMax(
+         MathMax(candleArray[2].open, candleArray[2].close),
+         MathMax(candleArray[3].open, candleArray[3].close)
+      );
+
+      if(high34Body > high12)
       {
-         // SL = lowest among 4 candles
-         sl = MathMin(MathMin(candleArray[0].low, candleArray[1].low),
-                      MathMin(candleArray[2].low, candleArray[3].low));
-         Print("📈 Bullish condition met → Opening BUY | SL=", sl);
+         // (3) SL = Lowest wick among all 4
+         sl = MathMin(
+            MathMin(candleArray[0].low, candleArray[1].low),
+            MathMin(candleArray[2].low, candleArray[3].low)
+         );
+
+         double risk = ask - sl;
+         tp = ask + (risk * RiskRewardRatio);
+
+         PrintFormat("📈 Bullish → BUY | Entry=%.3f | SL=%.3f | TP=%.3f | High12=%.3f | High34Body=%.3f",
+                     ask, sl, tp, high12, high34Body);
          tradeBuy(symbol, lotSize, sl, tp, slippage);
       }
       else
-         Print("⚠️ Bullish condition not met → Trade skipped");
-   }
-   else // Bearish
-   {
-      double low12 = MathMin(candleArray[0].low, candleArray[1].low);
-      double low34 = MathMin(candleArray[2].open, candleArray[2].close);
-      low34 = MathMin(low34, MathMin(candleArray[3].open, candleArray[3].close));
-
-      if(low34 < low12)
       {
-         // SL = highest among 4 candles
-         sl = MathMax(MathMax(candleArray[0].high, candleArray[1].high),
-                      MathMax(candleArray[2].high, candleArray[3].high));
-         Print("📉 Bearish condition met → Opening SELL | SL=", sl);
+         PrintFormat("⚠️ Bullish not met | High34Body=%.3f ≤ High12=%.3f", high34Body, high12);
+      }
+   }
+   // ---- Bearish Condition ----
+   else
+   {
+      // (1) Lowest wick price among candle 1 and 2
+      double low12 = MathMin(candleArray[0].low, candleArray[1].low);
+
+      // (2) Lowest body price among candle 3 and 4 (only open/close)
+      double low34Body = MathMin(
+         MathMin(candleArray[2].open, candleArray[2].close),
+         MathMin(candleArray[3].open, candleArray[3].close)
+      );
+
+      if(low34Body < low12)
+      {
+         // (3) SL = Highest wick among all 4
+         sl = MathMax(
+            MathMax(candleArray[0].high, candleArray[1].high),
+            MathMax(candleArray[2].high, candleArray[3].high)
+         );
+
+         double risk = sl - bid;
+         tp = bid - (risk * RiskRewardRatio);
+
+         PrintFormat("📉 Bearish → SELL | Entry=%.3f | SL=%.3f | TP=%.3f | Low12=%.3f | Low34Body=%.3f",
+                     bid, sl, tp, low12, low34Body);
          tradeSell(symbol, lotSize, sl, tp, slippage);
       }
       else
-         Print("⚠️ Bearish condition not met → Trade skipped");
+      {
+         PrintFormat("⚠️ Bearish not met | Low34Body=%.3f ≥ Low12=%.3f", low34Body, low12);
+      }
    }
 }
 
@@ -257,33 +303,7 @@ void tradeSell(string symbol, double lot, double sl, double tp, int slippage)
 }
 
 //+------------------------------------------------------------------+
-void ApplyTrailingStop()
-{
-    int total = PositionsTotal();
-    for(int i=0; i<total; i++)
-    {
-        ulong ticket = PositionGetTicket(i);
-        if(PositionSelectByTicket(ticket))
-        {
-            string symbol = PositionGetString(POSITION_SYMBOL);
-            long type = PositionGetInteger(POSITION_TYPE);
-            double sl = PositionGetDouble(POSITION_SL);
-            double tp = PositionGetDouble(POSITION_TP);
-            double currentPrice = (type == POSITION_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_BID) : SymbolInfoDouble(symbol, SYMBOL_ASK);
 
-            if(type == POSITION_TYPE_BUY)
-            {
-                double newSL = currentPrice - trailingStopPoints * _Point;
-                if(newSL > sl) tradeModify(ticket, newSL, tp);
-            }
-            else if(type == POSITION_TYPE_SELL)
-            {
-                double newSL = currentPrice + trailingStopPoints * _Point;
-                if(newSL < sl) tradeModify(ticket, newSL, tp);
-            }
-        }
-    }
-}
 
 //+------------------------------------------------------------------+
 void tradeModify(ulong ticket, double sl, double tp)
@@ -303,3 +323,101 @@ void tradeModify(ulong ticket, double sl, double tp)
       Print("✅ Order modified: SL=", sl, " TP=", tp);
 }
 //+------------------------------------------------------------------+
+
+///tailing ////////////////
+/////
+///
+//+------------------------------------------------------------------+
+//| Apply ATR-based Trailing Stop                                   |
+//+------------------------------------------------------------------+
+void ApplyATRTrailingStop(double atrPeriod = 14, double atrMultiplier = 1.5)
+{
+   int total = PositionsTotal();
+   if(total == 0)
+      return;
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      if(!PositionSelectByTicket(i)) continue;
+
+      string sym = PositionGetString(POSITION_SYMBOL);
+      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl        = PositionGetDouble(POSITION_SL);
+      double tp        = PositionGetDouble(POSITION_TP);
+      double bid       = SymbolInfoDouble(sym, SYMBOL_BID);
+      double ask       = SymbolInfoDouble(sym, SYMBOL_ASK);
+
+      // --- Calculate ATR value dynamically
+      double atrValue[];
+      if(CopyBuffer(iATR(sym, PERIOD_CURRENT, (int)atrPeriod), 0, 0, 1, atrValue) <= 0)
+      {
+         Print("⚠️ ATR data not available for ", sym);
+         continue;
+      }
+
+      double atr = atrValue[0];
+      double newSL;
+
+      // --- BUY trailing
+      if(type == POSITION_TYPE_BUY)
+      {
+         newSL = bid - (atr * atrMultiplier);
+
+         if((sl == 0.0 || newSL > sl) && newSL > openPrice)
+         {
+            if(trade.PositionModify(sym, newSL, tp))
+               PrintFormat("📈 ATR Trailing BUY | New SL=%.3f | ATR=%.3f", newSL, atr);
+            else
+               PrintFormat("❌ Failed to modify BUY SL | Err=%d", GetLastError());
+         }
+      }
+
+      // --- SELL trailing
+      if(type == POSITION_TYPE_SELL)
+      {
+         newSL = ask + (atr * atrMultiplier);
+
+         if((sl == 0.0 || newSL < sl) && newSL < openPrice)
+         {
+            if(trade.PositionModify(sym, newSL, tp))
+               PrintFormat("📉 ATR Trailing SELL | New SL=%.3f | ATR=%.3f", newSL, atr);
+            else
+               PrintFormat("❌ Failed to modify SELL SL | Err=%d", GetLastError());
+         }
+      }
+   }
+}
+
+///stoploess////////////////
+/////
+///
+void SetInitialStopLoss()
+{
+   for(int i=PositionsTotal()-1; i>=0; i--)
+   {
+      string sym = PositionGetSymbol(i);
+      if(!PositionSelect(sym)) continue;
+
+      long   type = PositionGetInteger(POSITION_TYPE);
+      double open = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl   = PositionGetDouble(POSITION_SL);
+      double tp   = PositionGetDouble(POSITION_TP);
+
+      // --- BUY ---
+      if(type==POSITION_TYPE_BUY && sl==0.0)
+      {
+         double newSL = NormalizeDouble(open - initialSLPoints * _Point, _Digits);
+         if(trade.PositionModify(sym,newSL,tp))
+            Print("Initial SL set for BUY: ", DoubleToString(newSL,_Digits));
+      }
+
+      // --- SELL ---
+      if(type==POSITION_TYPE_SELL && sl==0.0)
+      {
+         double newSL = NormalizeDouble(open + initialSLPoints * _Point, _Digits);
+         if(trade.PositionModify(sym,newSL,tp))
+            Print("Initial SL set for SELL: ", DoubleToString(newSL,_Digits));
+      }
+   }
+}
