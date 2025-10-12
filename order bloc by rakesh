@@ -20,12 +20,14 @@ struct CandleData {
 CandleData candleArray[4];
 int candleCount = 0;
 datetime lastCandleTime = 0;
+input double TrailingMultiplier = 1.0;   // 1.0 = normal, 1.5 = 50% more distance
+
 
 input double RiskRewardRatio = 1.0;      // Take Profit = RRR × Risk
-input double BreakEvenTrigger = 300;     // Move SL to BE after profit in points (e.g. 300 = 30 pips if 5-digit)
+input double BreakEvenTrigger = 500;     // Move SL to BE after profit in points (e.g. 300 = 30 pips if 5-digit)
 input double BreakEvenBuffer = 50; 
-input int    trailingPoints = 600;      // Trailing Stop distance (points)
-input int    initialSLPoints= 2000;        // Add small profit buffer (e.g. 50 = 5 pips)
+input int    trailingPoints = 15000;      // Trailing Stop distance (points)
+input int    initialSLPoints= 20000;        // Add small profit buffer (e.g. 50 = 5 pips)
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -37,12 +39,16 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnTick()
 {
+  
 
- // Ensure every trade has a stop loss
+
+
+
+
    SetInitialStopLoss();
 
    // Manage trailing stop
-   ApplyATRTrailingStop();
+ApplyTrailingStop();
    
    
     datetime currentCandleTime = iTime(_Symbol, PERIOD_M1, 0);
@@ -123,7 +129,7 @@ void AddCandle(const CandleData &c)
       candleCount++;
       PrintFormat("✅ Candle stored in array [%d/4]", candleCount);
    }
-
+ 
    if(candleCount == 4)
    {
       Print("✅ Pattern complete! Displaying candles...");
@@ -146,7 +152,7 @@ void AddCandle(const CandleData &c)
 //+------------------------------------------------------------------+
 void CheckExtraConditionAndTrade()
 {
-   double lotSize = 0.01;
+   double lotSize = 0.02;
    string symbol = _Symbol;
    int slippage = 5;
    double sl = 0;
@@ -154,7 +160,20 @@ void CheckExtraConditionAndTrade()
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
+
+ // ✅ Check if any of the 4 candles is a Doji
+   for(int i = 0; i < 4; i++)
+   {
+      if(IsDoji(candleArray[i].open, candleArray[i].close, candleArray[i].high, candleArray[i].low))
+      {
+         PrintFormat("🚫 Candle %d is a Doji (O=%.2f, C=%.2f, H=%.2f, L=%.2f) → No trade.", 
+                     i+1, candleArray[i].open, candleArray[i].close, candleArray[i].high, candleArray[i].low);
+         return; // ❌ Exit function — no trade
+      }
+   }
    // ---- Bullish Condition ----
+   
+   
    if(candleArray[3].isBullish)
    {
       // (1) Highest wick price among candle 1 and 2
@@ -179,7 +198,7 @@ void CheckExtraConditionAndTrade()
 
          PrintFormat("📈 Bullish → BUY | Entry=%.3f | SL=%.3f | TP=%.3f | High12=%.3f | High34Body=%.3f",
                      ask, sl, tp, high12, high34Body);
-         tradeBuy(symbol, lotSize, sl, tp, slippage);
+         tradeBuy(symbol, lotSize);
       }
       else
       {
@@ -211,7 +230,7 @@ void CheckExtraConditionAndTrade()
 
          PrintFormat("📉 Bearish → SELL | Entry=%.3f | SL=%.3f | TP=%.3f | Low12=%.3f | Low34Body=%.3f",
                      bid, sl, tp, low12, low34Body);
-         tradeSell(symbol, lotSize, sl, tp, slippage);
+         tradeSell(symbol, lotSize);
       }
       else
       {
@@ -253,9 +272,12 @@ void ResetCandleArray()
 }
 
 //+------------------------------------------------------------------+
-void tradeBuy(string symbol, double lot, double sl, double tp, int slippage)
+void tradeBuy(string symbol, double lot)
 {
    double price = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double sl = NormalizeDouble(price - initialSLPoints * _Point, _Digits);
+   double tp = NormalizeDouble(price + (initialSLPoints * RiskRewardRatio) * _Point, _Digits);
+
    MqlTradeRequest request;
    MqlTradeResult result;
    ZeroMemory(request); ZeroMemory(result);
@@ -265,22 +287,24 @@ void tradeBuy(string symbol, double lot, double sl, double tp, int slippage)
    request.volume    = lot;
    request.type      = ORDER_TYPE_BUY;
    request.price     = price;
-   request.sl        = sl;
-   request.tp        = tp;
-   request.deviation = slippage;
-   request.magic     = 123456;
+   request.sl        = sl;   // <---- ✅ Set SL
+   request.tp        = tp;   // <---- ✅ Set TP
    request.comment   = "CandleTrackerBuy";
 
    if(!OrderSend(request, result))
       Print("❌ BUY OrderSend failed: ", GetLastError());
    else
-      Print("✅ BUY Order opened at ", price);
+      Print("✅ BUY Order opened at ", price, " SL=", sl, " TP=", tp);
 }
 
+
 //+------------------------------------------------------------------+
-void tradeSell(string symbol, double lot, double sl, double tp, int slippage)
+void tradeSell(string symbol, double lot)
 {
    double price = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double sl = NormalizeDouble(price + initialSLPoints * _Point, _Digits);
+   double tp = NormalizeDouble(price - (initialSLPoints * RiskRewardRatio) * _Point, _Digits);
+
    MqlTradeRequest request;
    MqlTradeResult result;
    ZeroMemory(request); ZeroMemory(result);
@@ -290,17 +314,16 @@ void tradeSell(string symbol, double lot, double sl, double tp, int slippage)
    request.volume    = lot;
    request.type      = ORDER_TYPE_SELL;
    request.price     = price;
-   request.sl        = sl;
-   request.tp        = tp;
-   request.deviation = slippage;
-   request.magic     = 123456;
+   request.sl        = sl;   // <---- ✅ Set SL
+   request.tp        = tp;   // <---- ✅ Set TP
    request.comment   = "CandleTrackerSell";
 
    if(!OrderSend(request, result))
       Print("❌ SELL OrderSend failed: ", GetLastError());
    else
-      Print("✅ SELL Order opened at ", price);
+      Print("✅ SELL Order opened at ", price, " SL=", sl, " TP=", tp);
 }
+
 
 //+------------------------------------------------------------------+
 
@@ -330,68 +353,97 @@ void tradeModify(ulong ticket, double sl, double tp)
 //+------------------------------------------------------------------+
 //| Apply ATR-based Trailing Stop                                   |
 //+------------------------------------------------------------------+
-void ApplyATRTrailingStop(double atrPeriod = 14, double atrMultiplier = 1.5)
+void ApplyTrailingStop()
 {
-   int total = PositionsTotal();
-   if(total == 0)
-      return;
-
-   for(int i = total - 1; i >= 0; i--)
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      if(!PositionSelectByTicket(i)) continue;
-
-      string sym = PositionGetString(POSITION_SYMBOL);
-      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl        = PositionGetDouble(POSITION_SL);
-      double tp        = PositionGetDouble(POSITION_TP);
-      double bid       = SymbolInfoDouble(sym, SYMBOL_BID);
-      double ask       = SymbolInfoDouble(sym, SYMBOL_ASK);
-
-      // --- Calculate ATR value dynamically
-      double atrValue[];
-      if(CopyBuffer(iATR(sym, PERIOD_CURRENT, (int)atrPeriod), 0, 0, 1, atrValue) <= 0)
-      {
-         Print("⚠️ ATR data not available for ", sym);
+      // get ticket and select by ticket (more reliable)
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) 
          continue;
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      string sym   = PositionGetString(POSITION_SYMBOL);
+      long   type  = PositionGetInteger(POSITION_TYPE);
+      double open  = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl    = PositionGetDouble(POSITION_SL);
+      double tp    = PositionGetDouble(POSITION_TP);
+      double price = (type == POSITION_TYPE_BUY)
+                     ? SymbolInfoDouble(sym, SYMBOL_BID)
+                     : SymbolInfoDouble(sym, SYMBOL_ASK);
+      double profit = PositionGetDouble(POSITION_PROFIT);
+      double volume = PositionGetDouble(POSITION_VOLUME);
+      int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+
+      // ===============================
+      // Symbol-based trailing settings
+      // ===============================
+      double profitTrigger = 0.50;   // default
+      double trailingGap   = 0.20;   // default
+
+      if (StringFind(sym, "BTC") >= 0)  // for BTCUSD or BTC-related pairs
+      {
+         profitTrigger = 0.50;     // start trailing after +$1 profit
+         trailingGap   = 0.20;     // keep SL $0.50 behind current price
+      }
+      else if (StringFind(sym, "XAU") >= 0) // for Gold pairs like XAUUSD
+      {
+         profitTrigger = 0.50;     // start trailing after +$0.50 profit
+         trailingGap   = 0.20;     // keep SL $0.20 behind current price
       }
 
-      double atr = atrValue[0];
-      double newSL;
+      // Only start trailing after reaching profit trigger
+      if (profit < profitTrigger)
+         continue;
 
-      // --- BUY trailing
-      if(type == POSITION_TYPE_BUY)
+      double newSL = 0.0;
+      bool update = false;
+
+      // BUY trade trailing logic
+      if (type == POSITION_TYPE_BUY)
       {
-         newSL = bid - (atr * atrMultiplier);
+         newSL = price - trailingGap;
+         newSL = NormalizeDouble(newSL, digits);
 
-         if((sl == 0.0 || newSL > sl) && newSL > openPrice)
-         {
-            if(trade.PositionModify(sym, newSL, tp))
-               PrintFormat("📈 ATR Trailing BUY | New SL=%.3f | ATR=%.3f", newSL, atr);
-            else
-               PrintFormat("❌ Failed to modify BUY SL | Err=%d", GetLastError());
-         }
+         if (newSL > sl && newSL > open)
+            update = true;
+      }
+      // SELL trade trailing logic
+      else if (type == POSITION_TYPE_SELL)
+      {
+         newSL = price + trailingGap;
+         newSL = NormalizeDouble(newSL, digits);
+
+         if ((sl == 0.0 || newSL < sl) && newSL < open)
+            update = true;
       }
 
-      // --- SELL trailing
-      if(type == POSITION_TYPE_SELL)
+      // Apply trailing stop modification
+      if (update)
       {
-         newSL = ask + (atr * atrMultiplier);
+         // modify by ticket rather than symbol to be extra safe
+         MqlTradeRequest req;
+         MqlTradeResult  res;
+         ZeroMemory(req);
+         ZeroMemory(res);
 
-         if((sl == 0.0 || newSL < sl) && newSL < openPrice)
-         {
-            if(trade.PositionModify(sym, newSL, tp))
-               PrintFormat("📉 ATR Trailing SELL | New SL=%.3f | ATR=%.3f", newSL, atr);
-            else
-               PrintFormat("❌ Failed to modify SELL SL | Err=%d", GetLastError());
-         }
+         req.action   = TRADE_ACTION_SLTP;
+         req.position = ticket;
+         req.sl       = newSL;
+         req.tp       = tp;
+
+         if(!OrderSend(req, res))
+            PrintFormat("Failed to modify SL for ticket %I64u: Error %d", ticket, GetLastError());
+         else
+            PrintFormat("Trailing Stop updated for %s %s (%.2f lots): SL = %.*f, Profit = %.2f USD",
+                        (type == POSITION_TYPE_BUY) ? "BUY" : "SELL",
+                        sym, volume, digits, newSL, profit);
       }
    }
 }
 
-///stoploess////////////////
-/////
-///
+
 void SetInitialStopLoss()
 {
    for(int i=PositionsTotal()-1; i>=0; i--)
@@ -420,4 +472,16 @@ void SetInitialStopLoss()
             Print("Initial SL set for SELL: ", DoubleToString(newSL,_Digits));
       }
    }
+}
+// -------------------------------------
+// 📍 Helper Function: Check if a candle is Doji
+// -------------------------------------
+bool IsDoji(double open, double close, double high, double low)
+{
+   double body = MathAbs(open - close);
+   double range = high - low;
+   if(range == 0) return true; // Avoid division by zero
+
+   double bodyRatio = body / range;
+   return (bodyRatio < 0.1);   // 10% or less of total range ⇒ Doji
 }
