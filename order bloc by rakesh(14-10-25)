@@ -49,6 +49,8 @@ void OnTick()
 
    // Manage trailing stop
 ApplyTrailingStop();
+
+
    
    
     datetime currentCandleTime = iTime(_Symbol, PERIOD_M1, 0);
@@ -106,7 +108,26 @@ ApplyTrailingStop();
             Print("🔁 Only violated candle stored as first candle");
         }
     }
+    CheckSpecialPattern(c);
+    
+    
+    ////// consoldation region finding
+    if(IsConsolidationZone(20))
+{
+   Print("⛔ Skipping trades — market is consolidating");
+     // Plays one of the default terminal sounds
+      PlaySound("alert.wav");
 
+   return;
+   
+}
+else
+{
+   // Safe to check for breakout or pattern
+Print("safe to go");
+
+
+}
     
 }
 
@@ -446,7 +467,11 @@ void ApplyTrailingStop()
 
 void SetInitialStopLoss()
 {
-   for(int i=PositionsTotal()-1; i>=0; i--)
+   double moneyPerLot = 200.0;  // $200 per 1.00 lot (=$2 for 0.01)
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       string sym = PositionGetSymbol(i);
       if(!PositionSelect(sym)) continue;
@@ -455,24 +480,47 @@ void SetInitialStopLoss()
       double open = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl   = PositionGetDouble(POSITION_SL);
       double tp   = PositionGetDouble(POSITION_TP);
+      double lot  = PositionGetDouble(POSITION_VOLUME);
 
-      // --- BUY ---
-      if(type==POSITION_TYPE_BUY && sl==0.0)
+      if(sl != 0.0) continue; // Skip if SL already exists
+
+      // --- calculate SL distance based on $ risk ---
+      double riskPerLotUSD = moneyPerLot;              // $200 per 1.00 lot
+      double dollarMovePerLot = 100.0;                 // for XAUUSD, $1 move = $100 per lot
+      double priceDistance = riskPerLotUSD / dollarMovePerLot; // e.g. 200/100=2.0
+
+      // --- calculate SL ---
+      double newSL = 0.0;
+      if(type == POSITION_TYPE_BUY)
       {
-         double newSL = NormalizeDouble(open - initialSLPoints * _Point, _Digits);
-         if(trade.PositionModify(sym,newSL,tp))
-            Print("Initial SL set for BUY: ", DoubleToString(newSL,_Digits));
+         newSL = NormalizeDouble(open - priceDistance, _Digits);
+         if(newSL >= bid) newSL = NormalizeDouble(bid - 1.0, _Digits); // ensure below market
+      }
+      else if(type == POSITION_TYPE_SELL)
+      {
+         newSL = NormalizeDouble(open + priceDistance, _Digits);
+         if(newSL <= ask) newSL = NormalizeDouble(ask + 1.0, _Digits); // ensure above market
       }
 
-      // --- SELL ---
-      if(type==POSITION_TYPE_SELL && sl==0.0)
+      // --- set stop loss ---
+      if(!trade.PositionModify(sym, newSL, tp))
       {
-         double newSL = NormalizeDouble(open + initialSLPoints * _Point, _Digits);
-         if(trade.PositionModify(sym,newSL,tp))
-            Print("Initial SL set for SELL: ", DoubleToString(newSL,_Digits));
+         int err = GetLastError();
+         PrintFormat("❌ Failed to set SL for %s %.2f lot | Error=%d | SL=%.2f | Dist=%.2f",
+                     type==POSITION_TYPE_BUY ? "BUY" : "SELL", lot, err, newSL, priceDistance);
+         ResetLastError();
+      }
+      else
+      {
+         PrintFormat("✅ SL set for %s %.2f lot | Risk=$%.2f | SL=%.2f | Dist=%.2f",
+                     type==POSITION_TYPE_BUY ? "BUY" : "SELL", lot, moneyPerLot * lot, newSL, priceDistance);
       }
    }
 }
+
+
+
+
 // -------------------------------------
 // 📍 Helper Function: Check if a candle is Doji
 // -------------------------------------
@@ -484,4 +532,185 @@ bool IsDoji(double open, double close, double high, double low)
 
    double bodyRatio = body / range;
    return (bodyRatio < 0.1);   // 10% or less of total range ⇒ Doji
+}
+//+------------------------------------------------------------------+
+//| Detects the 4-Candle Reversal Pattern (3 bullish + 1 bearish OR  |
+//| 3 bearish + 1 bullish) with Dynamic Reset                        |
+//+------------------------------------------------------------------+
+CandleData patternArray[4];
+int patternCount = 0;
+
+void ResetPattern(const CandleData &startCandle)
+{
+   patternArray[0] = startCandle;
+   patternCount = 1;
+   PrintFormat("🔄 Pattern reset → starting from new candle at %s", TimeToString(startCandle.time));
+}
+
+void CheckSpecialPattern(const CandleData &c)
+{
+   // Step 1️⃣: Add new candle or reset if needed
+   if (patternCount == 0)
+   {
+      patternArray[0] = c;
+      patternCount = 1;
+      PrintFormat("🔎 Starting new pattern with candle %s", TimeToString(c.time));
+      return;
+   }
+
+   CandleData last = patternArray[patternCount - 1];
+
+   // Step 2️⃣: Type consistency logic
+   if (patternCount == 1)
+   {
+      // Wait for second candle — must be same type
+      if (c.isBullish == last.isBullish)
+      {
+         patternArray[1] = c;
+         patternCount = 2;
+         Print("✅ Second candle matches type → continuing pattern...");
+      }
+      else
+      {
+         Print("❌ Candle 2 type mismatch → resetting pattern");
+         ResetPattern(c);
+         return;
+      }
+   }
+   else if (patternCount == 2)
+   {
+      // Wait for third candle — must also be same type
+      if (c.isBullish == last.isBullish)
+      {
+         patternArray[2] = c;
+         patternCount = 3;
+         Print("✅ Third candle matches type → continuing pattern...");
+      }
+      else
+      {
+         Print("❌ Candle 3 type mismatch → resetting pattern");
+         ResetPattern(c);
+         return;
+      }
+   }
+   else if (patternCount == 3)
+   {
+      // Fourth candle must be opposite type
+      if (c.isBullish != last.isBullish)
+      {
+         patternArray[3] = c;
+         patternCount = 4;
+         Print("✅ Fourth candle opposite → checking structure...");
+      }
+      else
+      {
+         Print("❌ Candle 4 type mismatch → resetting pattern");
+         ResetPattern(c);
+         return;
+      }
+   }
+
+   // Step 3️⃣: Check full pattern when 4 candles collected
+   if (patternCount == 4)
+   {
+      CandleData c1 = patternArray[0];
+      CandleData c2 = patternArray[1];
+      CandleData c3 = patternArray[2];
+      CandleData c4 = patternArray[3];
+
+      bool first3Bullish = c1.isBullish && c2.isBullish && c3.isBullish;
+      bool fourthBearish = !c4.isBullish;
+      bool first3Bearish = !c1.isBullish && !c2.isBullish && !c3.isBullish;
+      bool fourthBullish = c4.isBullish;
+
+      // ---- BEARISH PATTERN ----
+      if (first3Bullish && fourthBearish)
+      {
+         double upperWick3 = c3.high - MathMax(c3.open, c3.close);
+         double lowerWick3 = MathMin(c3.open, c3.close) - c3.low;
+         double body3 = MathAbs(c3.close - c3.open);
+         double low4Body = MathMin(c4.open, c4.close);
+
+         bool cond2 = (c2.low > c1.high);
+         bool cond3 = (c3.low > c2.high);
+         bool cond3Wick = (upperWick3 > body3 && upperWick3 > lowerWick3);
+         bool cond4 = (low4Body < c3.low);
+
+         if (cond2 && cond3 && cond3Wick && cond4)
+         {
+            Print("📉 Bearish pattern detected → Opening SELL");
+            double lot = 0.01;
+            double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            double sl = c3.high;
+            double tp = price - (sl - price) * RiskRewardRatio;
+            trade.Sell(lot, _Symbol, price);
+         }
+         else
+         {
+            Print("❌ Bearish pattern invalid → resetting from current candle");
+            ResetPattern(c);
+            return;
+         }
+      }
+
+      // ---- BULLISH PATTERN ----
+      else if (first3Bearish && fourthBullish)
+      {
+         double lowerWick3 = MathMin(c3.open, c3.close) - c3.low;
+         double upperWick3 = c3.high - MathMax(c3.open, c3.close);
+         double body3 = MathAbs(c3.close - c3.open);
+         double high4Body = MathMax(c4.open, c4.close);
+
+         bool cond2 = (c2.high < c1.low);
+         bool cond3 = (c3.high < c2.low);
+         bool cond3Wick = (lowerWick3 > body3 && lowerWick3 > upperWick3);
+         bool cond4 = (high4Body > c3.high);
+
+         if (cond2 && cond3 && cond3Wick && cond4)
+         {
+            Print("📈 Bullish pattern detected → Opening BUY");
+            double lot = 0.01;
+            double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+            double sl = c3.low;
+            double tp = price + (price - sl) * RiskRewardRatio;
+            trade.Buy(lot, _Symbol, price);
+         }
+         else
+         {
+            Print("❌ Bullish pattern invalid → resetting from current candle");
+            ResetPattern(c);
+            return;
+         }
+      }
+
+      // Reset pattern for next sequence
+      Print("🔁 Pattern complete → Resetting for next detection");
+      ResetPattern(c);
+   }
+}
+//// consoldation funtion///
+/////                    ///\
+
+///////////////////////////////
+
+bool IsConsolidationZone(int barsBack=15)
+{
+   double highest = iHigh(_Symbol, PERIOD_M5, iHighest(_Symbol, PERIOD_M5, MODE_HIGH, barsBack, 1));
+   double lowest  = iLow(_Symbol, PERIOD_M5, iLowest(_Symbol, PERIOD_M5, MODE_LOW, barsBack, 1));
+   double range = highest - lowest;
+
+   double avgBody = 0;
+   for(int i=1; i<=barsBack; i++)
+   {
+      double open  = iOpen(_Symbol, PERIOD_M5, i);
+      double close = iClose(_Symbol, PERIOD_M5, i);
+      avgBody += MathAbs(close - open);
+   }
+   avgBody /= barsBack;
+
+   // Conditions: small overall range + small average candle body
+   if(range < avgBody * 4)
+      return true;
+   else
+      return false;
 }
