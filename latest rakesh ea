@@ -86,7 +86,7 @@ ApplyTrailingStop();
     }
     else
     {
-        Print("❌ Condition violated → Resetting array & storing violated candle");
+       
 
         // If previous candle exists and same type as violated candle
         if(candleCount > 0 && candleArray[candleCount-1].isBullish == c.isBullish)
@@ -97,7 +97,7 @@ ApplyTrailingStop();
             candleArray[0] = prev;
             candleArray[1] = c;
             candleCount = 2;
-            Print("🔁 Previous candle and violated candle are same type → Stored as first two candles");
+            Print(" first two candles");
         }
         else
         {
@@ -180,7 +180,7 @@ void AddCandle(const CandleData &c)
 //+------------------------------------------------------------------+
 void CheckExtraConditionAndTrade()
 {
-   double lotSize = 0.01;
+   double lotSize = 0.10;
    string symbol = _Symbol;
    int slippage = 5;
    double sl = 0;
@@ -224,13 +224,13 @@ void CheckExtraConditionAndTrade()
          double risk = ask - sl;
          tp = ask + (risk * RiskRewardRatio);
 
-         PrintFormat("📈 Bullish → BUY | Entry=%.3f | SL=%.3f | TP=%.3f | High12=%.3f | High34Body=%.3f",
+         PrintFormat("condition1 Bullish → BUY | Entry=%.3f | SL=%.3f | TP=%.3f | High12=%.3f | High34Body=%.3f",
                      ask, sl, tp, high12, high34Body);
          tradeBuy(symbol, lotSize);
       }
       else
       {
-         PrintFormat("⚠️ Bullish not met | High34Body=%.3f ≤ High12=%.3f", high34Body, high12);
+         PrintFormat("condition1⚠️ Bullish not met | High34Body=%.3f ≤ High12=%.3f", high34Body, high12);
       }
    }
    // ---- Bearish Condition ----
@@ -256,13 +256,13 @@ void CheckExtraConditionAndTrade()
          double risk = sl - bid;
          tp = bid - (risk * RiskRewardRatio);
 
-         PrintFormat("📉 Bearish → SELL | Entry=%.3f | SL=%.3f | TP=%.3f | Low12=%.3f | Low34Body=%.3f",
+         PrintFormat(" condition1📉 Bearish → SELL | Entry=%.3f | SL=%.3f | TP=%.3f | Low12=%.3f | Low34Body=%.3f",
                      bid, sl, tp, low12, low34Body);
          tradeSell(symbol, lotSize);
       }
       else
       {
-         PrintFormat("⚠️ Bearish not met | Low34Body=%.3f ≥ Low12=%.3f", low34Body, low12);
+         PrintFormat("condition1⚠️ Bearish not met | Low34Body=%.3f ≥ Low12=%.3f", low34Body, low12);
       }
    }
 }
@@ -302,6 +302,23 @@ void ResetCandleArray()
 //+------------------------------------------------------------------+
 void tradeBuy(string symbol, double lot)
 {
+ // 🔍 Check if there's already an open BUY trade for this symbol
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      string posSymbol = PositionGetSymbol(i);
+      if (posSymbol == symbol)
+      {
+         if (PositionSelect(symbol))
+         {
+            long posType = PositionGetInteger(POSITION_TYPE);
+            if (posType == POSITION_TYPE_BUY)
+            {
+               Print("⚠️ Existing BUY position found on ", symbol, " — skipping new trade.");
+               return; // ❌ Exit without opening another trade
+            }
+         }
+      }
+   }
    double price = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double sl = NormalizeDouble(price - initialSLPoints * _Point, _Digits);
    double tp = NormalizeDouble(price + (initialSLPoints * RiskRewardRatio) * _Point, _Digits);
@@ -328,7 +345,26 @@ void tradeBuy(string symbol, double lot)
 
 //+------------------------------------------------------------------+
 void tradeSell(string symbol, double lot)
+
 {
+// 🔍 Check if there's already an open SELL trade for this symbol
+   for (int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      string posSymbol = PositionGetSymbol(i);
+      if (posSymbol == symbol)
+      {
+         if (PositionSelect(symbol))
+         {
+            long posType = PositionGetInteger(POSITION_TYPE);
+            if (posType == POSITION_TYPE_SELL)
+            {
+               Print("⚠️ Existing SELL position found on ", symbol, " — skipping new trade.");
+               return; // ❌ Exit without opening another trade
+            }
+         }
+      }
+   }
+
    double price = SymbolInfoDouble(symbol, SYMBOL_BID);
    double sl = NormalizeDouble(price + initialSLPoints * _Point, _Digits);
    double tp = NormalizeDouble(price - (initialSLPoints * RiskRewardRatio) * _Point, _Digits);
@@ -404,7 +440,7 @@ void ApplyTrailingStop()
       // =======================================
       // 🔴 NEW: Close if loss exceeds -$5
       // =======================================
-      if (profit <= -10.0)
+      if (profit <= -20.0)
       {
          PrintFormat("⚠️ Closing position due to loss limit | %s %s | Profit: %.2f USD",
                      (type == POSITION_TYPE_BUY) ? "BUY" : "SELL", sym, profit);
@@ -420,7 +456,7 @@ void ApplyTrailingStop()
       // ===============================
       // Symbol-based trailing settings
       // ===============================
-      double profitTrigger = 0.50;   // default
+      double profitTrigger = 1.0;   // default
       double trailingGap   = 0.20;   // default
 
       if (StringFind(sym, "BTC") >= 0)
@@ -433,6 +469,13 @@ void ApplyTrailingStop()
          profitTrigger = 0.50;
          trailingGap   = 0.20;
       }
+      else {
+       profitTrigger = 0.50;
+         trailingGap   = 0.20;
+      }
+
+
+
 
       // Only start trailing after reaching profit trigger
       if (profit < profitTrigger)
@@ -513,119 +556,114 @@ void ResetPattern(const CandleData &startCandle)
    patternCount = 1;
    PrintFormat("🔄 Pattern reset → starting from new candle at %s", TimeToString(startCandle.time));
 }
-
 void CheckSpecialPattern(const CandleData &c)
 {
-   // Step 1️⃣: Add first candle
+   // Step 1️⃣: Start new pattern
    if (patternCount == 0)
    {
       patternArray[0] = c;
       patternCount = 1;
-      PrintFormat("🟢 Starting new pattern at candle time %s", TimeToString(c.time));
+      PrintFormat("condition3 🟢 Starting new pattern at candle %s", TimeToString(c.time));
       return;
    }
 
    CandleData last = patternArray[patternCount - 1];
 
-   // Step 2️⃣: Handle 2nd and 3rd candle (same direction continuation)
+   // Step 2️⃣: Continue 2nd & 3rd candle (same direction only)
    if (patternCount == 1 || patternCount == 2)
    {
       if (c.isBullish == last.isBullish)
       {
-         double prevBodyTop    = MathMax(last.open, last.close);
-         double prevBodyBottom = MathMin(last.open, last.close);
-
-         bool valid = false;
-
-         if (c.isBullish)
-         {
-            // For bullish continuation → low must be at least 75% above previous body top
-            double tolerance = prevBodyTop + (MathAbs(last.close - last.open) * 0.25);
-            valid = (c.low > tolerance);
-         }
-         else
-         {
-            // For bearish continuation → high must be at least 75% below previous body bottom
-            double tolerance = prevBodyBottom - (MathAbs(last.close - last.open) * 0.25);
-            valid = (c.high < tolerance);
-         }
-
-         if (valid)
-         {
-            patternArray[patternCount] = c;
-            patternCount++;
-            PrintFormat("✅ Candle %d continues pattern | Type=%s | Low=%.2f | High=%.2f",
-                        patternCount, c.isBullish ? "Bullish" : "Bearish", c.low, c.high);
-         }
-         else
-         {
-            PrintFormat("❌ Candle %d overlaps previous candle body → Resetting pattern",
-                        patternCount + 1);
-            ResetPattern(c);
-            return;
-         }
+         patternArray[patternCount] = c;
+         patternCount++;
+         PrintFormat("condition3 ✅ Candle %d continues pattern | Type=%s",
+                     patternCount, c.isBullish ? "Bullish" : "Bearish");
       }
       else
       {
-         Print("❌ Candle type mismatch → Resetting pattern");
+         Print("condition3 ❌ Candle type mismatch → Resetting pattern");
          ResetPattern(c);
-         return;
       }
+      return;
    }
 
-   // Step 3️⃣: Check 4th candle (engulfing rule)
+   // Step 3️⃣: Check 4th candle for reversal engulf
    else if (patternCount == 3)
    {
       CandleData c3 = patternArray[2];
-      double bodyTop3 = MathMax(c3.open, c3.close);
-      double bodyBottom3 = MathMin(c3.open, c3.close);
       bool engulf = false;
 
-      // --- Bearish Engulfing ---
+      // --- 🔻 Bearish reversal ---
       if (c3.isBullish && !c.isBullish)
       {
-         // Allow 75% engulf instead of 100%
-         double engulfTolerance = bodyBottom3 + (bodyTop3 - bodyBottom3) * 0.25;
-         engulf = (c.open > bodyTop3 && c.close < engulfTolerance);
+         // Bearish candle’s *body* (open-close range) covers full c3 (body + wick)
+         double bearBodyTop = MathMax(c.open, c.close);
+         double bearBodyBottom = MathMin(c.open, c.close);
+
+         engulf = (bearBodyTop >= c3.high && bearBodyBottom <= c3.low);
 
          if (engulf)
          {
-            Print("📉 Bearish Engulfing detected → Opening SELL");
+            Print("condition3 📉 Bearish BODY Engulfs full previous candle (body+wick) → SELL");
             double lot = 0.02;
             double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
             double sl = c3.high;
             double tp = price - (sl - price) * RiskRewardRatio;
-            trade.Sell(lot, _Symbol, price);
+
+            if (!trade.Sell(lot, _Symbol, price, sl, tp, "BearishBodyEngulf"))
+               PrintFormat("❌ SELL failed: %d", GetLastError());
+            else
+               PrintFormat("✅ SELL placed | Entry=%.5f SL=%.5f TP=%.5f", price, sl, tp);
+
             ResetPattern(c);
             return;
          }
       }
 
-      // --- Bullish Engulfing ---
+      // --- 🔺 Bullish reversal ---
       else if (!c3.isBullish && c.isBullish)
       {
-         double engulfTolerance = bodyTop3 - (bodyTop3 - bodyBottom3) * 0.25;
-         engulf = (c.open < bodyBottom3 && c.close > engulfTolerance);
+         // Bullish candle’s *body* covers full previous candle (body+wick)
+         double bullBodyTop = MathMax(c.open, c.close);
+         double bullBodyBottom = MathMin(c.open, c.close);
+
+         engulf = (bullBodyTop >= c3.high && bullBodyBottom <= c3.low);
 
          if (engulf)
          {
-            Print("📈 Bullish Engulfing detected → Opening BUY");
+            Print("condition3 📈 Bullish BODY Engulfs full previous candle (body+wick) → BUY");
             double lot = 0.02;
             double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
             double sl = c3.low;
             double tp = price + (price - sl) * RiskRewardRatio;
-            trade.Buy(lot, _Symbol, price);
+
+            if (!trade.Buy(lot, _Symbol, price, sl, tp, "BullishBodyEngulf"))
+               PrintFormat("❌ BUY failed: %d", GetLastError());
+            else
+               PrintFormat("✅ BUY placed | Entry=%.5f SL=%.5f TP=%.5f", price, sl, tp);
+
             ResetPattern(c);
             return;
          }
       }
 
-      // No engulf → reset pattern
-      Print("❌ 4th candle failed to engulf → Resetting pattern");
+      // --- Same direction → shift pattern (continue trend)
+      if (!engulf && c.isBullish == c3.isBullish)
+      {
+         patternArray[0] = patternArray[1];
+         patternArray[1] = patternArray[2];
+         patternArray[2] = c;
+         Print("condition3 🔁 Same direction continuation → Shift pattern forward");
+         return;
+      }
+
+      // --- No engulf → reset pattern
+      Print("condition3 ❌ 4th candle failed full body engulf → Resetting pattern");
       ResetPattern(c);
       return;
    }
 }
+
 
 //// consoldation funtion///
 /////                    ///\
@@ -694,13 +732,12 @@ void GetAllTimePriceRange(string symbol, ENUM_TIMEFRAMES timeframe,
 
 void CheckThreeCandleEngulfing()
 {
-Print("checking statergy no2");
 // ✅ Check if any of the 4 candles is a Doji
    for(int i = 0; i < candleCount; i++)
    {
       if(IsDoji(candleArray[i].open, candleArray[i].close, candleArray[i].high, candleArray[i].low))
       {
-         PrintFormat("🚫 Candle %d is a Doji (O=%.2f, C=%.2f, H=%.2f, L=%.2f) → No trade.", 
+         PrintFormat("condition2🚫 Candle %d is a Doji (O=%.2f, C=%.2f, H=%.2f, L=%.2f) → No trade.", 
                      i+1, candleArray[i].open, candleArray[i].close, candleArray[i].high, candleArray[i].low);
          return; // ❌ Exit function — no trade
       }
@@ -708,7 +745,6 @@ Print("checking statergy no2");
    
    if (candleCount == 3)
    {
-   
       CandleData c1 = candleArray[0];
       CandleData c2 = candleArray[1];
       CandleData c3 = candleArray[2];
@@ -729,35 +765,132 @@ Print("checking statergy no2");
 
       if (isBullishEngulf)
       {
-         Print("📈 Bullish engulfing (including wicks) detected → Opening BUY");
-         double lot = 0.01;
+         Print("condition2📈 Bullish engulfing (including wicks) detected → Opening BUY");
+         double lot = 0.02;
          double price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          double sl = c3.low;  
          double tp = price + (price - sl) * RiskRewardRatio;
-         trade.Buy(lot, _Symbol, price );
-         PrintFormat("✅ BUY placed  statergy no2); | Entry=%.3f SL=%.3f TP=%.3f", price, sl, tp);
+         if (IsNearbyFVG(_Symbol, "BUY"))
+         {
+          return;
+         }
+         else
+         {
+          trade.Buy(lot, _Symbol, price );
+         
+         }
+       
+        
           // Reset array keeping the current candle
       ResetCandleArray();
       candleArray[0] = c3;
       candleCount = 1;
-      Print("🔁 Engulf pattern handled → Array reset with engulfing candle as first");
+      Print("condittion2🔁 Engulf pattern handled → Array reset with engulfing candle as first");
       }
       else if (isBearishEngulf)
       {
-         Print("📉 Bearish engulfing (including wicks) detected → Opening SELL");
-         double lot = 0.01;
+         Print("codition2📉 Bearish engulfing (including wicks) detected → Opening SELL");
+         double lot = 0.02;
          double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          double sl = c3.high;  
          double tp = price - (sl - price) * RiskRewardRatio;
-         trade.Sell(lot, _Symbol, price);
-         PrintFormat("✅ SELL placed | Entry=%.3f SL=%.3f TP=%.3f",tp);
-          // Reset array keeping the current candle
+          if (IsNearbyFVG(_Symbol, "SELL"))
+         {
+          return;
+         }
+         else
+         {
+          trade.Sell(lot, _Symbol, price );
+            PrintFormat("condition2✅ SELL placed | Entry=%.3f SL=%.3f TP=%.3f",tp);
+        
+         }
+         
       ResetCandleArray();
       candleArray[0] = c3;
       candleCount = 1;
-      Print("🔁 Engulf pattern handled → Array reset with engulfing candle as first");
+      Print("condition2🔁 Engulf pattern handled → Array reset with engulfing candle as first");
       }
 
      
    }
+}
+////////////////////////////////////////////////////////////////////////fvg
+bool IsNearbyFVG(string symbol, string direction)
+{
+   ENUM_TIMEFRAMES tf = (ENUM_TIMEFRAMES)ChartPeriod(0);
+   int lookback = 100;
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double minGap = 5 * point;           // Minimum 5-point gap
+   double distanceThreshold = 2 * point; // Allow small distance for "nearby"
+
+   for (int i = 2; i < lookback; i++)
+   {
+      double high1 = iHigh(symbol, tf, i);
+      double low1  = iLow(symbol, tf, i);
+      double high3 = iHigh(symbol, tf, i + 2);
+      double low3  = iLow(symbol, tf, i + 2);
+
+      // --- Bullish FVG (low1 > high3) ---
+      if (low1 - high3 >= minGap && direction == "BUY")
+      {
+         double gapTop = low1;
+         double gapBottom = high3;
+         double current = SymbolInfoDouble(symbol, SYMBOL_BID);
+
+         // Price must be inside or close to the FVG
+         if (current >= gapBottom - distanceThreshold && current <= gapTop + distanceThreshold)
+         {
+            // Check if mitigated (touched by later candles)
+            bool mitigated = false;
+            for (int j = i - 1; j >= 1; j--)
+            {
+               double prevHigh = iHigh(symbol, tf, j);
+               double prevLow  = iLow(symbol, tf, j);
+               if (prevLow <= gapTop && prevHigh >= gapBottom)
+               {
+                  mitigated = true;
+                  break;
+               }
+            }
+
+            if (mitigated)
+            {
+               PrintFormat("✅ Bullish FVG found (%.2f–%.2f, gap=%.1f pts)", gapBottom, gapTop, (low1 - high3) / point);
+               return true;
+            }
+         }
+      }
+
+      // --- Bearish FVG (high1 < low3) ---
+      if (low3 - high1 >= minGap && direction == "SELL")
+      {
+         double gapTop = low3;
+         double gapBottom = high1;
+         double current = SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+         if (current <= gapTop + distanceThreshold && current >= gapBottom - distanceThreshold)
+         {
+            bool mitigated = false;
+            for (int j = i - 1; j >= 1; j--)
+            {
+               double prevHigh = iHigh(symbol, tf, j);
+               double prevLow  = iLow(symbol, tf, j);
+               if (prevLow <= gapTop && prevHigh >= gapBottom)
+               {
+                  mitigated = true;
+                  break;
+               }
+            }
+
+            if (mitigated)
+            {
+               PrintFormat("✅ Bearish FVG found (%.2f–%.2f, gap=%.1f pts)", gapBottom, gapTop, (low3 - high1) / point);
+               return true;
+            }
+         }
+      }
+   }
+
+   PrintFormat("🚫 No valid FVG (≥5 pts) found for %s direction", direction);
+   return false;
 }
